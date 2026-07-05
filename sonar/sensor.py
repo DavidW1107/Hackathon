@@ -42,11 +42,12 @@ NEAR = 0.10                   # closest detectable range (m) — coherent ref ha
 MAX_RANGE = 2.0               # farthest mapped range (m); overrides sonar default
 
 CLUTTER_THRESH = 0.45         # fraction of background peak = a static reflector
-SNR_THRESH = 6.0              # detect when residual peak > median + SNR_THRESH*sigma
+SNR_THRESH = 3.0              # detect when residual peak > median + SNR_THRESH*sigma
 ABS_FLOOR = 0.002             # min residual (echo/direct ratio) to count
 WARMUP = 15                   # windows to learn the static background before detecting
 CAL_RATE = 1.0 / 12           # background learning rate during warmup
 BG_ADAPT = 0.02               # slow background adaptation in quiet bins
+GUARD = 40                    # bins around the peak excluded from the CFAR noise estimate
 
 _cfg = {"snr": SNR_THRESH}    # live-tunable via GET /config?snr=<val>
 _bg = {"prof": None, "warm": 0}    # complex static background + warmup counter
@@ -161,8 +162,8 @@ def process_window(rec2, flen):
         d = int(np.argmax(np.abs(c0)))
         if d + maxlag > len(c0) or abs(c0[d]) < 1e-9:
             continue
-        segs.append(c0[d + minlag:d + maxlag] / c0[d])   # reference -> cancel gain/phase
-        ds.append(d)
+        segs.append(c0[d + minlag:d + maxlag] / c0[d])   # per-ping ref cancels the phase
+        ds.append(d)                                     # drift a slow ref can't track
     if not segs:
         return [], [], _dbg()
     nb = min(len(s) for s in segs)
@@ -180,8 +181,10 @@ def process_window(rec2, flen):
         return _clutter(np.abs(B), rng, rec2, flen, t0, minlag, P), [], _dbg(warm=True)
 
     resid = np.abs(cur - B)                              # coherent subtraction (static ~0)
-    med = float(np.median(resid))
-    sigma = 1.4826 * float(np.median(np.abs(resid - med))) + 1e-9   # robust MAD noise
+    i = int(np.argmax(resid))                            # CFAR: exclude the peak's own lobe
+    noise = np.concatenate([resid[:max(i - GUARD, 0)], resid[i + GUARD:]])  # from the noise est
+    med = float(np.median(noise))
+    sigma = 1.4826 * float(np.median(np.abs(noise - med))) + 1e-9
     thr = med + _cfg["snr"] * sigma
     B[resid < med + 3 * sigma] = ((1 - BG_ADAPT) * B + BG_ADAPT * cur)[resid < med + 3 * sigma]
 
@@ -212,39 +215,54 @@ def process_window(rec2, flen):
 # ---------- capture ----------
 
 def live_loop():
-    """Blocking playrec loop: emit PULSES_PER_WIN chirps, capture 2 ch, detect."""
+    """Continuous full-duplex stream (shared clock -> stable phase, so coherent
+    subtraction actually cancels). Emits a looping chirp; a queue feeds windows to
+    the detector, advancing one ping at a time. Blocking playrec cannot do this."""
+    import queue
     import sounddevice as sd
-    sd.default.device = DEVICE
     flen = int(FS * FRAME_MS / 1000)
     build_mf(flen)
-    chirp = make_chirp()                                 # real chirp for transmit
-    fr = np.zeros(flen, dtype=np.float32); fr[:len(chirp)] = chirp
-    emit = np.tile(fr, PULSES_PER_WIN) * 0.8
-    t_start = time.monotonic()
+    chirp = make_chirp()
+    tx = np.zeros(flen, dtype=np.float32); tx[:len(chirp)] = chirp * 0.8
+    win = PULSES_PER_WIN * flen
+    q: "queue.Queue[np.ndarray]" = queue.Queue()
+    st = {"tx": 0}
+
+    def cb(indata, outdata, frames, tinfo, status):
+        idx = (st["tx"] + np.arange(frames)) % flen        # loop the chirp forever
+        outdata[:] = tx[idx][:, None]
+        st["tx"] = (st["tx"] + frames) % flen
+        q.put(indata.copy())                                # 2-ch capture -> main loop
+
     prev = []
-    dt = PULSES_PER_WIN * FRAME_MS / 1000
+    dt = flen / FS                                          # windows advance one ping
+    t_start = time.monotonic()
     print(f"live sensing on device {DEVICE}  (band={sonar.F0 // 1000}-{sonar.F1 // 1000}kHz, "
           f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, snr>{_cfg['snr']:.0f})")
     print(f"tune live:  curl 'http://localhost:{PORT}/config?snr=8'\n")
-    while True:
-        rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
-        try:
-            clutter, targets, dbg = process_window(rec, flen)
-        except Exception as e:
-            print("process error:", e); continue
-        # persistence + velocity: keep targets matching one from the previous frame.
-        shown = []
-        for t in targets:
-            near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
-            if near and abs(near["range"] - t["range"]) < 0.6:
-                t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
-                shown.append(t)
-        for i, t in enumerate(shown):
-            t["id"] = i
-        prev = targets
-        ts = time.monotonic() - t_start
-        _publish(ts, clutter, shown)
-        (_draw_map if _view["map"] else _log)(ts, dbg, clutter, shown)
+    buf = np.zeros((0, 2), dtype=np.float32)
+    with sd.Stream(samplerate=FS, channels=2, dtype="float32", device=DEVICE, callback=cb):
+        while True:
+            buf = np.concatenate([buf, q.get()])
+            while len(buf) >= win:
+                window = buf[:win]
+                buf = buf[flen:]                            # advance exactly one ping
+                try:
+                    clutter, targets, dbg = process_window(window, flen)
+                except Exception as e:
+                    print("process error:", e); continue
+                shown = []
+                for t in targets:                           # persistence + velocity
+                    near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
+                    if near and abs(near["range"] - t["range"]) < 0.6:
+                        t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
+                        shown.append(t)
+                for i, t in enumerate(shown):
+                    t["id"] = i
+                prev = targets
+                ts = time.monotonic() - t_start
+                _publish(ts, clutter, shown)
+                (_draw_map if _view["map"] else _log)(ts, dbg, clutter, shown)
 
 
 def sim_loop():
