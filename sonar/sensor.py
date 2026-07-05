@@ -64,6 +64,7 @@ if os.path.exists(CALIB_FILE):
 
 _cfg = {"motion": MOTION_THRESH}   # live-tunable via GET /config?motion=<val>
 _bg = {"prof": None, "warm": 0}    # MTI static-scene background + warmup counter
+_view = {"map": False}             # --map: draw a top-down ASCII radar instead of log lines
 _latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "clutter": [], "targets": []}
 _lock = threading.Lock()
 
@@ -248,7 +249,7 @@ def live_loop():
         prev = targets
         ts = time.monotonic() - t_start
         _publish(ts, clutter, shown)
-        _log(ts, dbg, shown)
+        (_draw_map if _view["map"] else _log)(ts, dbg, clutter, shown)
 
 
 def sim_loop():
@@ -278,7 +279,7 @@ def _publish(t, clutter, targets):
         _latest.update(t=round(t, 2), clutter=clutter, targets=targets)
 
 
-def _log(ts, dbg, targets):
+def _log(ts, dbg, clutter, targets):
     """Readable per-window line; expands to one row per moving target."""
     if dbg.get("warm"):
         print(f"[{ts:6.1f}s]  learning background…", flush=True)
@@ -293,6 +294,38 @@ def _log(ts, dbg, targets):
         bar = "█" * min(int(t["strength"] * 20), 20)
         print(f"      {t['class']:<7} {t['range']:4.2f}m  az {t['az']:+6.1f}°  "
               f"{t['vel']:4.2f} m/s  refl {bar}", flush=True)
+
+
+def _draw_map(ts, dbg, clutter, targets):
+    """Live top-down ASCII radar: sensor at bottom-centre, depth up, azimuth across."""
+    W, H = 61, 20
+    cx, cy = W // 2, H - 1
+    grid = [[" "] * W for _ in range(H)]
+
+    def put(r, az, ch):
+        a = math.radians(az)
+        col = cx + int(round(r * math.sin(a) / MAX_RANGE * cx))
+        row = cy - int(round(r * math.cos(a) / MAX_RANGE * (H - 1)))
+        if 0 <= row < H and 0 <= col < W:
+            grid[row][col] = ch
+
+    for c in clutter:
+        put(c["range"], c["az"], "·")
+    for t in targets:
+        put(t["range"], t["az"], {"human": "H", "falling": "*"}.get(t["class"], "#"))
+    grid[cy][cx] = "^"
+
+    status = ("learning background…" if dbg.get("warm") else
+              f"floor={dbg['floor']:.3f} peak={dbg['peak']:.3f} thr={dbg['thr']:.3f} moving={len(targets)}")
+    lines = ["\033[H\033[2J",                                    # home cursor + clear
+             f" t={ts:6.1f}s   {status}",
+             " legend: H=human  #=hard  *=falling  ·=static  ^=sensor",
+             " +" + "-" * W + "+"]
+    lines += [" |" + "".join(r) + "|" for r in grid]
+    lines.append(" +" + "-" * W + f"+  depth 0..{MAX_RANGE:.0f}m up, width +/-{FOV}deg")
+    for t in targets:
+        lines.append(f"   {t['class']:<7} {t['range']:.2f}m  az {t['az']:+.0f}deg  {t['vel']:.2f}m/s")
+    print("\n".join(lines), flush=True)
 
 
 def calibrate(angle_deg):
@@ -372,10 +405,13 @@ if __name__ == "__main__":
                     help="initial motion threshold (default from MOTION_THRESH); tune live via /config")
     ap.add_argument("--band", choices=["high", "low"], default="high",
                     help="high=17-21kHz near-inaudible; low=8-12kHz audible but far more coherent")
+    ap.add_argument("--map", action="store_true", help="live top-down ASCII radar in the terminal")
     a = ap.parse_args()
 
     if a.band == "low":                    # longer wavelength -> far less phase-noise
         sonar.F0, sonar.F1 = 8000, 12000
+    if a.map:
+        _view["map"] = True
     if a.motion is not None:
         _cfg["motion"] = a.motion
 
