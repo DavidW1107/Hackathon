@@ -42,12 +42,14 @@ NEAR = 0.10                   # closest detectable range (m) — coherent ref ha
 MAX_RANGE = 2.0               # farthest mapped range (m); overrides sonar default
 
 CLUTTER_THRESH = 0.45         # fraction of background peak = a static reflector
-SNR_THRESH = 3.0              # detect when residual peak > median + SNR_THRESH*sigma
+SNR_THRESH = 5.0              # detect when residual peak > median + SNR_THRESH*sigma
 ABS_FLOOR = 0.002             # min residual (echo/direct ratio) to count
-WARMUP = 15                   # windows to learn the static background before detecting
-CAL_RATE = 1.0 / 12           # background learning rate during warmup
-BG_ADAPT = 0.02               # slow background adaptation in quiet bins
-GUARD = 40                    # bins around the peak excluded from the CFAR noise estimate
+WARMUP = 20                   # windows to learn the static background + noise floor
+BG_ADAPT = 0.02               # slow background drift far from activity
+BG_FAST = 0.30                # fast absorption of confirmed phase-frozen (stale) residue
+EMA_A = 0.15                  # temporal-coherence smoothing per window
+COH_STALE = 0.95              # residue coherence above this = static change, not a live target
+STALE_RUN = 30                # windows coherence must stay high before absorbing (~2.7 s)
 
 _cfg = {"snr": SNR_THRESH, "abs": None}   # abs = absolute residual threshold; overrides snr
 _bg = {"prof": None, "warm": 0}    # complex static background + warmup counter
@@ -172,43 +174,72 @@ def process_window(rec2, flen):
     t0 = int(np.median(ds))
 
     B = _bg["prof"]
-    if B is None or len(B) != nb:                        # (re)initialise background
-        _bg["prof"] = cur.copy(); _bg["warm"] = 0
+    if B is None or len(B) != nb:                        # (re)init + start calibration
+        _bg.update(prof=cur.copy(), warm=0, cal=[cur.copy()])
         return [], [], _dbg(warm=True)
-    if _bg["warm"] < WARMUP:                             # learn the static scene
-        _bg["prof"] = (1 - CAL_RATE) * B + CAL_RATE * cur
-        _bg["warm"] += 1
-        return _clutter(np.abs(B), rng, rec2, flen, t0, minlag, P), [], _dbg(warm=True)
+    if _bg["warm"] < WARMUP:                             # accumulate the static scene
+        _bg["cal"].append(cur.copy()); _bg["warm"] += 1
+        if _bg["warm"] >= WARMUP:                        # learn bg + FIXED noise floor
+            _bg["prof"] = np.mean(_bg["cal"], axis=0)
+            pool = np.concatenate([np.abs(c - _bg["prof"]) for c in _bg["cal"]])
+            _bg["med"] = float(np.median(pool))
+            _bg["sigma"] = 1.4826 * float(np.median(np.abs(pool - _bg["med"]))) + 1e-9
+            _bg["ema_c"] = np.zeros(nb, dtype=complex)
+            _bg["ema_m"] = np.zeros(nb)
+            _bg["run"] = np.zeros(nb)
+            _bg["cal"] = []
+        return _clutter(np.abs(_bg["prof"]), rng, rec2, flen, t0, minlag, P), [], _dbg(warm=True)
 
-    resid = np.abs(cur - B)                              # coherent subtraction (static ~0)
-    i = int(np.argmax(resid))                            # CFAR: exclude the peak's own lobe
-    noise = np.concatenate([resid[:max(i - GUARD, 0)], resid[i + GUARD:]])  # from the noise est
-    med = float(np.median(noise))
-    sigma = 1.4826 * float(np.median(np.abs(noise - med))) + 1e-9
+    cres = cur - B
+    resid = np.abs(cres)
+    med, sigma = _bg["med"], _bg["sigma"]
+    # temporal coherence = |mean(residual)| / mean(|residual|). A live target wanders
+    # in echo phase (coh low); frozen residue (drift, moved object) -> coh ~1.
+    _bg["ema_c"] = (1 - EMA_A) * _bg["ema_c"] + EMA_A * cres
+    _bg["ema_m"] = (1 - EMA_A) * _bg["ema_m"] + EMA_A * resid
+    coh = np.abs(_bg["ema_c"]) / (_bg["ema_m"] + 1e-12)
+    loud = resid > med + 4 * sigma
+    # ema_m gate stops a freshly-appeared target (one frame faking coh~1) qualifying;
+    # the run counter ignores the brief still moments of a breathing person.
+    high = loud & (coh > COH_STALE) & (_bg["ema_m"] > 0.7 * resid)
+    _bg["run"] = np.where(high, _bg["run"] + 1, 0)
+    stale = _bg["run"] >= STALE_RUN
+    live = np.where(stale, 0.0, resid)                   # only non-frozen bins are targets
+
+    # bg update: absorb stale fast; never absorb a live target or its skirt; drift elsewhere
+    protect = np.convolve((loud & ~stale).astype(float), np.ones(31), "same") > 0
+    rate = np.where(stale, BG_FAST, np.where(protect | loud, 0.0, BG_ADAPT))
+    _bg["prof"] = B + rate * (cur - B)
+
     thr = _cfg["abs"] if _cfg["abs"] is not None else med + _cfg["snr"] * sigma
-    B[resid < med + 3 * sigma] = ((1 - BG_ADAPT) * B + BG_ADAPT * cur)[resid < med + 3 * sigma]
-
-    clutter = _clutter(np.abs(B), rng, rec2, flen, t0, minlag, P)
+    clutter = _clutter(np.abs(_bg["prof"]), rng, rec2, flen, t0, minlag, P)
     dbg = _dbg(sigma, float(resid.max()), thr, 0, False)
-    targets = []
-    clusters = _clusters(resid > thr)
+    targets, detected = [], False
+    clusters = _clusters(live > thr)
     dbg["raw"] = len(clusters)
     for a, b in clusters:
         if rng[b] - rng[a] > 1.5:
             continue
-        peak = a + int(np.argmax(resid[a:b + 1]))
-        if resid[peak] < ABS_FLOOR:
+        peak = a + int(np.argmax(live[a:b + 1]))
+        if live[peak] < ABS_FLOOR:
             continue
+        detected = True
         targets.append({"id": 0, "range": round(float(rng[peak]), 2),
                         "az": round(_az_at(rec2, flen, t0, minlag, peak, P), 1),
                         "vel": 0.0, "strength": round(float(min(abs(cur[peak]), 1.0)), 2),
                         "spread": round(float(min(rng[b] - rng[a], 1.0)), 2),
                         "class": "motion", "snr": round(float((resid[peak] - med) / sigma), 1),
-                        "_m": float(resid[peak])})
+                        "_m": float(live[peak])})
     targets.sort(key=lambda t: -t["_m"])
     targets = targets[:3]
     for t in targets:
         t.pop("_m")
+    # drift the noise floor only when nothing is detected (never ratchet over a target)
+    if not detected:
+        q = resid[~loud]
+        if len(q) > 40:
+            m = float(np.median(q)); s = 1.4826 * float(np.median(np.abs(q - m))) + 1e-9
+            _bg["med"] += 0.1 * (m - _bg["med"]); _bg["sigma"] += 0.1 * (s - _bg["sigma"])
     return clutter, targets, dbg
 
 
