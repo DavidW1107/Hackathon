@@ -36,7 +36,13 @@
   .k{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.24em;color:var(--green);text-transform:uppercase;margin-top:20px}
   .title{font-family:"Space Grotesk",sans-serif;font-weight:600;font-size:26px;margin-top:8px;letter-spacing:-.01em}
   .sub{color:var(--inkDim);font-size:11.5px;line-height:1.5;margin-top:6px}
-  canvas{display:block;margin:12px auto 0;width:250px;height:250px}
+  .radar{position:relative;width:250px;margin:12px auto 0}
+  .radar canvas{display:block;width:250px;height:250px}
+  .core{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+    width:52px;height:34px;display:flex;align-items:center;justify-content:center;
+    border:1px solid rgba(52,226,122,.5);border-radius:6px;
+    background:linear-gradient(135deg,#0E1512,#0B100E);box-shadow:0 0 26px rgba(34,224,107,.35);
+    font-family:"IBM Plex Mono",monospace;font-size:8px;letter-spacing:1.2px;color:var(--green)}
   /* detection-distance slider (matches latest app) */
   .dist{margin-top:14px;border:1px solid var(--lineGreen);border-radius:12px;background:var(--bgRaise);padding:14px 16px 10px}
   .drow{display:flex;align-items:center}
@@ -65,8 +71,8 @@
       <div class="notch"></div>
       <div class="k">02 · Scanning</div>
       <div class="title">Room A4</div>
-      <div class="sub">Sweeping the space in front of the station. Green pings are moving reflectors picked out of the static room.</div>
-      <canvas id="r" width="500" height="500"></canvas>
+      <div class="sub">Sweeping the space in front of the station. Green pings are moving reflectors picked out of the static room, in real time.</div>
+      <div class="radar"><canvas id="r" width="500" height="500"></canvas><div class="core">SONR</div></div>
       <div class="dist">
         <div class="drow"><span class="dl">DETECTION DISTANCE</span><span class="dv">3.1 m</span></div>
         <div class="track"><div class="fill"></div><div class="thumb"></div></div>
