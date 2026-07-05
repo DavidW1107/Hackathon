@@ -49,7 +49,7 @@ CAL_RATE = 1.0 / 12           # background learning rate during warmup
 BG_ADAPT = 0.02               # slow background adaptation in quiet bins
 GUARD = 40                    # bins around the peak excluded from the CFAR noise estimate
 
-_cfg = {"snr": SNR_THRESH}    # live-tunable via GET /config?snr=<val>
+_cfg = {"snr": SNR_THRESH, "abs": None}   # abs = absolute residual threshold; overrides snr
 _bg = {"prof": None, "warm": 0}    # complex static background + warmup counter
 _mf = {"conj": None, "cn": 0, "nfft": 0}   # complex matched-filter kernel (set per band)
 _view = {"map": False}
@@ -185,7 +185,7 @@ def process_window(rec2, flen):
     noise = np.concatenate([resid[:max(i - GUARD, 0)], resid[i + GUARD:]])  # from the noise est
     med = float(np.median(noise))
     sigma = 1.4826 * float(np.median(np.abs(noise - med))) + 1e-9
-    thr = med + _cfg["snr"] * sigma
+    thr = _cfg["abs"] if _cfg["abs"] is not None else med + _cfg["snr"] * sigma
     B[resid < med + 3 * sigma] = ((1 - BG_ADAPT) * B + BG_ADAPT * cur)[resid < med + 3 * sigma]
 
     clutter = _clutter(np.abs(B), rng, rec2, flen, t0, minlag, P)
@@ -237,9 +237,10 @@ def live_loop():
     prev = []
     dt = flen / FS                                          # windows advance one ping
     t_start = time.monotonic()
+    mode = f"abs>{_cfg['abs']}" if _cfg["abs"] is not None else f"snr>{_cfg['snr']:.0f}"
     print(f"live sensing on device {DEVICE}  (band={sonar.F0 // 1000}-{sonar.F1 // 1000}kHz, "
-          f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, snr>{_cfg['snr']:.0f})")
-    print(f"tune live:  curl 'http://localhost:{PORT}/config?snr=8'\n")
+          f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, {mode})")
+    print(f"tune live:  curl 'http://localhost:{PORT}/config?thresh=0.6'   (or ?snr=5, ?thresh=auto)\n")
     buf = np.zeros((0, 2), dtype=np.float32)
     with sd.Stream(samplerate=FS, channels=2, dtype="float32", device=DEVICE, callback=cb):
         while True:
@@ -413,6 +414,12 @@ class Handler(BaseHTTPRequestHandler):
                     _cfg["snr"] = max(0.5, min(30.0, float(q["snr"][0])))
                 except ValueError:
                     pass
+            if "thresh" in q:                            # absolute; "auto" reverts to snr
+                v = q["thresh"][0]
+                try:
+                    _cfg["abs"] = None if v in ("", "auto", "off") else float(v)
+                except ValueError:
+                    pass
             body = json.dumps(_cfg).encode()
         else:
             with _lock:
@@ -435,7 +442,9 @@ if __name__ == "__main__":
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (with --record)")
     ap.add_argument("--calibrate", type=float, metavar="DEG",
                     help="calibrate azimuth: reflector at this known angle (right +)")
-    ap.add_argument("--snr", type=float, metavar="K", help="detection threshold in sigma (default 6)")
+    ap.add_argument("--snr", type=float, metavar="K", help="adaptive threshold in sigma (default 3)")
+    ap.add_argument("--thresh", type=float, metavar="T",
+                    help="absolute residual threshold (overrides --snr; watch peak= to pick it)")
     ap.add_argument("--band", choices=["high", "low"], default="high",
                     help="high=17-21kHz near-inaudible; low=8-12kHz audible but far more coherent")
     ap.add_argument("--map", action="store_true", help="live top-down ASCII radar in the terminal")
@@ -446,6 +455,8 @@ if __name__ == "__main__":
         sonar.F0, sonar.F1 = 8000, 12000
     if a.snr is not None:
         _cfg["snr"] = a.snr
+    if a.thresh is not None:
+        _cfg["abs"] = a.thresh
     if a.selftest:
         motion_selftest()
         sys.exit()
