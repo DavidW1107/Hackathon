@@ -1,4 +1,5 @@
 __pycache__/
 .venv/
+calib.json
 scan.png
 scan.npy

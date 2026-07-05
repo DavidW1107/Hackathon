@@ -26,6 +26,8 @@ reflectivity + range-spread + speed. Doppler/micro-Doppler is the upgrade.
 import argparse
 import json
 import math
+import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -43,10 +45,19 @@ FOV = 50                      # forward cone half-angle (deg) we trust azimuth w
 # detection thresholds (tune live) — ponytail: hand-tuned heuristics, swap for a
 # trained classifier if it misfires.
 CLUTTER_THRESH = 0.45         # fraction of peak = a static reflector
-MOTION_THRESH = 0.12          # cross-pulse std (normalised) = movement
+MOTION_THRESH = 0.15          # cross-pulse std (normalised) = movement
 FALL_SPEED = 2.0              # m/s and tight -> falling/thrown
 SPREAD_HUMAN = 0.30           # range-spread (m) or weak echo -> soft/human
 SENSOR_MIN = 0.5              # m; skip near-field crosstalk zone (false motion)
+
+# azimuth calibration (baseline in m + sign), overridden by calib.json if present
+CALIB_FILE = os.path.join(os.path.dirname(__file__), "calib.json")
+_calib = {"baseline": MIC_BASELINE, "sign": 1.0}
+if os.path.exists(CALIB_FILE):
+    try:
+        _calib.update(json.load(open(CALIB_FILE)))
+    except Exception:
+        pass
 
 _latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "clutter": [], "targets": []}
 _lock = threading.Lock()
@@ -76,15 +87,18 @@ def _parabolic(y, i):
     return float(i)
 
 
-def _azimuth(seg0, seg1):
-    """Inter-mic lag -> azimuth (deg). Coarse; front cone only."""
+def _lag(seg0, seg1):
+    """Sub-sample inter-mic delay (samples) via cross-correlation."""
     a = seg0 - seg0.mean(); b = seg1 - seg1.mean()
     if a.std() < 1e-6 or b.std() < 1e-6:
         return 0.0
-    xc = np.correlate(a, b, "full")
-    i = int(np.argmax(np.abs(xc)))
-    lag = _parabolic(np.abs(xc), i) - (len(b) - 1)
-    sin_th = np.clip(lag / FS * C / MIC_BASELINE, -1, 1)
+    xc = np.abs(np.correlate(a, b, "full"))
+    return _parabolic(xc, int(np.argmax(xc))) - (len(b) - 1)
+
+
+def _azimuth(seg0, seg1):
+    """Inter-mic lag -> azimuth (deg), using calibrated baseline + sign. Front cone only."""
+    sin_th = np.clip(_calib["sign"] * _lag(seg0, seg1) / FS * C / _calib["baseline"], -1, 1)
     return math.degrees(math.asin(sin_th))
 
 
@@ -122,7 +136,7 @@ def process_window(rec2, chirp, flen):
     clutter = [{"range": round(float(rng[i]), 2),
                 "az": round(_az_at(rec2, flen, t0, minlag, i, P), 1),
                 "strength": round(float(mean_n[i]), 2)}
-               for i in _peaks(mean_n * gate, rng, CLUTTER_THRESH)]
+               for i in _peaks(mean_n * gate, rng, CLUTTER_THRESH, min_sep=0.5, cap=6)]
 
     targets = []
     for a, b in _clusters((motion_n > MOTION_THRESH) & gate):
@@ -139,8 +153,8 @@ def process_window(rec2, chirp, flen):
                         "az": round(az, 1), "vel": round(speed, 2),
                         "strength": round(strength, 2), "spread": round(min(spread, 1.0), 2),
                         "class": classify(strength, spread, speed), "_m": float(motion_n[peak])})
-    targets.sort(key=lambda t: -t["_m"])            # strongest movers first, cap 5
-    targets = targets[:5]
+    targets.sort(key=lambda t: -t["_m"])            # strongest movers first
+    targets = targets[:3]
     for i, t in enumerate(targets):
         t["id"] = i; t.pop("_m")
     return clutter, targets
@@ -171,55 +185,31 @@ def classify(strength, spread, speed):
 # ---------- capture loops ----------
 
 def live_loop():
-    """Continuous full-duplex stream: emit a looping chirp, ring-buffer the mic,
-    process the most-recent window every ~100 ms (sliding, no dead time)."""
+    """Blocking playrec loop: emit PULSES_PER_WIN chirps, capture 2 ch, detect.
+    ponytail: ~3 Hz and rock-solid. A callback stream is faster but segfaulted on
+    this ALSA setup; the viewer lerp-smooths to 60 fps so 3 Hz reads fine.
+    Knob: lower PULSES_PER_WIN for snappier (noisier) updates."""
     import sounddevice as sd
+    sd.default.device = DEVICE
     chirp = make_chirp()
     flen = int(FS * FRAME_MS / 1000)
-    emit_frame = np.zeros(flen, dtype=np.float32)
-    emit_frame[:len(chirp)] = chirp * 0.8
-    win = PULSES_PER_WIN * flen
-    ring = np.zeros((win * 2, 2), dtype=np.float32)
-    st = {"w": 0, "op": 0, "filled": 0}
-
-    def cb(indata, outdata, frames, tinfo, status):
-        idx = (st["op"] + np.arange(frames)) % flen        # loop the chirp forever
-        outdata[:] = emit_frame[idx][:, None]
-        st["op"] = (st["op"] + frames) % flen
-        w, n = st["w"], frames                              # ring-buffer the capture
-        if w + n <= len(ring):
-            ring[w:w + n] = indata
-        else:
-            k = len(ring) - w
-            ring[w:] = indata[:k]; ring[:n - k] = indata[k:]
-        st["w"] = (w + n) % len(ring)
-        st["filled"] = min(st["filled"] + n, len(ring))
-
+    fr = np.zeros(flen, dtype=np.float32); fr[:len(chirp)] = chirp
+    emit = np.tile(fr, PULSES_PER_WIN) * 0.8
     t_start = time.monotonic()
-    with sd.Stream(samplerate=FS, dtype="float32", channels=(2, 2),
-                   device=(DEVICE, DEVICE), callback=cb):
-        print(f"streaming on device {DEVICE}, ~10 Hz detection")
-        prev = []
-        while True:
-            time.sleep(0.1)
-            if st["filled"] < win:
-                continue
-            w = st["w"]
-            # arbitrary window start is fine: chirps are periodic at flen, so
-            # process_window's summed-correlation t0 lands consistently.
-            seg = (ring[w - win:w] if w >= win
-                   else np.vstack([ring[len(ring) - (win - w):], ring[:w]])).copy()
-            try:
-                clutter, targets = process_window(seg, chirp, flen)
-            except Exception as e:
-                print("process error:", e); continue
-            # 2-window persistence: a real mover corroborates across frames within
-            # ~0.4 m; isolated noise bursts don't. ponytail: range-only match.
-            matched = [t for t in targets if any(abs(t["range"] - r) < 0.4 for r in prev)]
-            prev = [t["range"] for t in targets]
-            for i, t in enumerate(matched):
-                t["id"] = i
-            _publish(time.monotonic() - t_start, clutter, matched)
+    prev = []
+    print(f"live sensing on device {DEVICE}")
+    while True:
+        rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
+        try:
+            clutter, targets = process_window(rec, chirp, flen)
+        except Exception as e:
+            print("process error:", e); continue
+        # 2-window persistence: real movers corroborate across frames within ~0.4 m.
+        matched = [t for t in targets if any(abs(t["range"] - r) < 0.4 for r in prev)]
+        prev = [t["range"] for t in targets]
+        for i, t in enumerate(matched):
+            t["id"] = i
+        _publish(time.monotonic() - t_start, clutter, matched)
 
 
 def sim_loop():
@@ -249,6 +239,42 @@ def _publish(t, clutter, targets):
         _latest.update(t=round(t, 2), clutter=clutter, targets=targets)
 
 
+def calibrate(angle_deg):
+    """Put a strong flat reflector (or stand) at a KNOWN azimuth (right = +, e.g.
+    1 m to your right at 2 m deep ~= +27 deg). Measures the inter-mic lag on the
+    dominant reflector and solves the mic baseline + sign. Writes calib.json.
+    ponytail: single-point solve; assumes boresight (straight-ahead) = 0 deg."""
+    import sounddevice as sd
+    sd.default.device = DEVICE
+    chirp = make_chirp()
+    flen = int(FS * FRAME_MS / 1000)
+    fr = np.zeros(flen, dtype=np.float32); fr[:len(chirp)] = chirp * 0.8
+    emit = np.tile(fr, PULSES_PER_WIN)
+    lags = []
+    print(f"calibrating: reflector at {angle_deg:+.0f} deg — hold still...")
+    for _ in range(12):
+        rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
+        c0 = np.abs(np.correlate(rec[:flen, 0], chirp, "valid"))
+        t0 = int(np.argmax(c0))
+        lo = t0 + int(2 * SENSOR_MIN / C * FS)
+        seg = c0[lo:min(t0 + int(2 * MAX_RANGE / C * FS), len(c0))]
+        if not len(seg):
+            continue
+        g = lo + int(np.argmax(seg))                 # dominant reflector past near field
+        lags.append(_lag(rec[:flen, 0][max(g - 200, 0):g + 200],
+                         rec[:flen, 1][max(g - 200, 0):g + 200]))
+    lag = float(np.median(lags)) if lags else 0.0
+    th = math.radians(angle_deg)
+    if abs(math.sin(th)) < 0.05 or abs(lag) < 1e-3:
+        print("calibration failed: use ~20-45 deg and a strong flat reflector.")
+        return
+    baseline = abs(lag) / FS * C / abs(math.sin(th))
+    sign = math.copysign(1, lag) * math.copysign(1, angle_deg)
+    json.dump({"baseline": round(baseline, 4), "sign": sign}, open(CALIB_FILE, "w"))
+    print(f"calibrated: lag={lag:.2f} samp -> baseline={baseline * 100:.1f} cm, "
+          f"sign={sign:+.0f}. Saved {CALIB_FILE}")
+
+
 # ---------- HTTP ----------
 
 class Handler(BaseHTTPRequestHandler):
@@ -274,7 +300,13 @@ if __name__ == "__main__":
     ap.add_argument("--sim", action="store_true", help="synthetic data, no hardware")
     ap.add_argument("--record", metavar="FILE", help="dump frames to FILE for replay")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (with --record)")
+    ap.add_argument("--calibrate", type=float, metavar="DEG",
+                    help="calibrate azimuth: reflector at this known angle (right +)")
     a = ap.parse_args()
+
+    if a.calibrate is not None:
+        calibrate(a.calibrate)
+        sys.exit()
 
     loop = sim_loop if a.sim else live_loop
 

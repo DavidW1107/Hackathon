@@ -6,7 +6,9 @@ import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js"
 
 const GREEN = 0x39ff88, HARD = 0xb8c2c9, SOFT = 0x6f7a74;
 const params = new URLSearchParams(location.search);
-const sensorUrl = params.get("sensor");          // ?sensor=http://localhost:8765 for live
+// live by default when viewing locally; a deployed (https) page falls back to replay.
+const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname);
+const sensorUrl = params.get("sensor") || (!params.has("demo") && isLocal ? "http://localhost:8765" : null);
 
 // ---------- scene ----------
 const scene = new THREE.Scene();
@@ -99,7 +101,7 @@ function buildClutter(f) {
     let m;
     if (c.strength > 0.6) {                            // strong reflector -> wall/door slab
       m = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.6, 0.08),
-        new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.15 + 0.3 * c.strength }));
+        new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.08 + 0.14 * c.strength }));
       m.position.set(p.x, 0.8, p.z);
     } else {                                           // weak reflector -> soft furniture blob
       m = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.5, 0.6),
@@ -147,11 +149,13 @@ function applyTargets(f) {
 }
 
 // ---------- data ----------
-let replay = null, ri = 0, mode = sensorUrl ? "LIVE" : "REPLAY", frame = null, last = null;
+let replay = null, ri = 0, mode = sensorUrl ? "LIVE" : "REPLAY", frame = null, last = null, liveFail = 0;
 async function nextFrame() {
-  if (sensorUrl) {
-    try { return await (await fetch(sensorUrl + "/", { cache: "no-store" })).json(); }
-    catch { mode = "LIVE (no signal)"; return null; }
+  if (sensorUrl && liveFail < 5) {                 // try live; fall back to replay after ~0.5s
+    try {
+      const f = await (await fetch(sensorUrl + "/", { cache: "no-store" })).json();
+      liveFail = 0; mode = "LIVE"; return f;
+    } catch { if (++liveFail >= 5) mode = "REPLAY (no sensor)"; return null; }
   }
   if (!replay) replay = await (await fetch("./sample.json", { cache: "no-store" })).json();
   return replay.length ? replay[ri++ % replay.length] : null;
