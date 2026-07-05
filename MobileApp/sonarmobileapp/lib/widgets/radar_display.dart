@@ -32,10 +32,12 @@ class RadarDisplay extends StatefulWidget {
   const RadarDisplay({
     super.key,
     required this.blips,
+    this.fovDeg = 50,
     this.armed = true,
   });
 
   final List<Blip> blips;
+  final double fovDeg;
   final bool armed;
 
   @override
@@ -81,6 +83,7 @@ class _RadarDisplayState extends State<RadarDisplay>
                       scan: _scan.value,
                       ping: _ping.value,
                       armed: widget.armed,
+                      fovDeg: widget.fovDeg,
                       blips: widget.blips,
                     ),
                   );
@@ -152,6 +155,7 @@ class _RadarPainter extends CustomPainter {
     required this.scan,
     required this.ping,
     required this.armed,
+    required this.fovDeg,
     required this.blips,
   });
 
@@ -159,10 +163,12 @@ class _RadarPainter extends CustomPainter {
   final double scan;
   final double ping;
   final bool armed;
+
+  /// Half-angle of the scan cone (the sensor's real field of view),
+  /// measured from straight up.
+  final double fovDeg;
   final List<Blip> blips;
 
-  /// Half-angle of the scan cone, measured from straight up.
-  static const _halfAngle = math.pi / 5.6; // ~32°
   static const _up = -math.pi / 2;
 
   @override
@@ -212,12 +218,13 @@ class _RadarPainter extends CustomPainter {
       axis,
     );
 
-    // upward scan cone rising from the core
+    // upward scan cone rising from the core, spanning the sensor's real FOV
     if (armed) {
+      final halfAngle = fovDeg * math.pi / 180;
       final bounds = Rect.fromCircle(center: center, radius: r);
       final cone = Path()
         ..moveTo(center.dx, center.dy)
-        ..arcTo(bounds, _up - _halfAngle, _halfAngle * 2, false)
+        ..arcTo(bounds, _up - halfAngle, halfAngle * 2, false)
         ..close();
 
       canvas.drawPath(
@@ -234,7 +241,7 @@ class _RadarPainter extends CustomPainter {
       );
 
       // bright cone edges
-      for (final angle in [_up - _halfAngle, _up + _halfAngle]) {
+      for (final angle in [_up - halfAngle, _up + halfAngle]) {
         final tip = Offset(
           center.dx + math.cos(angle) * r,
           center.dy + math.sin(angle) * r,
@@ -258,8 +265,8 @@ class _RadarPainter extends CustomPainter {
         if (pulseR < 10) continue;
         canvas.drawArc(
           Rect.fromCircle(center: center, radius: pulseR),
-          _up - _halfAngle,
-          _halfAngle * 2,
+          _up - halfAngle,
+          halfAngle * 2,
           false,
           Paint()
             ..style = PaintingStyle.stroke
@@ -304,5 +311,8 @@ class _RadarPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_RadarPainter old) =>
-      old.scan != scan || old.ping != ping || old.armed != armed;
+      old.scan != scan ||
+      old.ping != ping ||
+      old.armed != armed ||
+      old.fovDeg != fovDeg;
 }
