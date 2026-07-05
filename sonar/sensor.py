@@ -50,8 +50,9 @@ BG_FAST = 0.30                # fast absorption of confirmed phase-frozen (stale
 EMA_A = 0.15                  # temporal-coherence smoothing per window
 COH_STALE = 0.95              # residue coherence above this = static change, not a live target
 STALE_RUN = 30                # windows coherence must stay high before absorbing (~2.7 s)
+FINE_JUMP = 2                 # peak may move this many range bins/window before phase aliases
 
-_cfg = {"snr": SNR_THRESH, "abs": None}   # abs = absolute residual threshold; overrides snr
+_cfg = {"snr": SNR_THRESH, "abs": None, "fine": False}   # abs overrides snr; fine = phase velocity
 _bg = {"prof": None, "warm": 0}    # complex static background + warmup counter
 _mf = {"conj": None, "cn": 0, "nfft": 0}   # complex matched-filter kernel (set per band)
 _view = {"map": False}
@@ -214,6 +215,7 @@ def process_window(rec2, flen):
     thr = _cfg["abs"] if _cfg["abs"] is not None else med + _cfg["snr"] * sigma
     clutter = _clutter(np.abs(_bg["prof"]), rng, rec2, flen, t0, minlag, P)
     dbg = _dbg(sigma, float(resid.max()), thr, 0, False)
+    fc = (sonar.F0 + sonar.F1) / 2                       # carrier for phase-based fine velocity
     targets, detected = [], False
     clusters = _clusters(live > thr)
     dbg["raw"] = len(clusters)
@@ -229,11 +231,10 @@ def process_window(rec2, flen):
                         "vel": 0.0, "strength": round(float(min(abs(cur[peak]), 1.0)), 2),
                         "spread": round(float(min(rng[b] - rng[a], 1.0)), 2),
                         "class": "motion", "snr": round(float((resid[peak] - med) / sigma), 1),
-                        "_m": float(live[peak])})
+                        "_m": float(live[peak]), "_bin": peak,           # phase-velocity state:
+                        "_z": complex(cres[peak]) * np.exp(-2j * np.pi * fc * peak / FS)})
     targets.sort(key=lambda t: -t["_m"])
-    targets = targets[:3]
-    for t in targets:
-        t.pop("_m")
+    targets = targets[:3]        # internal _-keys stripped before publish in live_loop
     # drift the noise floor only when nothing is detected (never ratchet over a target)
     if not detected:
         q = resid[~loud]
@@ -267,8 +268,10 @@ def live_loop():
 
     prev = []
     dt = flen / FS                                          # windows advance one ping
+    FC = (sonar.F0 + sonar.F1) / 2                          # carrier for phase velocity
     t_start = time.monotonic()
-    mode = f"abs>{_cfg['abs']}" if _cfg["abs"] is not None else f"snr>{_cfg['snr']:.0f}"
+    mode = (f"abs>{_cfg['abs']}" if _cfg["abs"] is not None else f"snr>{_cfg['snr']:.0f}") \
+        + (" +fine-vel" if _cfg["fine"] else "")
     print(f"live sensing on device {DEVICE}  (band={sonar.F0 // 1000}-{sonar.F1 // 1000}kHz, "
           f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, {mode})")
     print(f"tune live:  curl 'http://localhost:{PORT}/config?thresh=0.6'   (or ?snr=5, ?thresh=auto)\n")
@@ -287,14 +290,19 @@ def live_loop():
                 for t in targets:                           # persistence + velocity
                     near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
                     if near and abs(near["range"] - t["range"]) < 0.6:
-                        t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
+                        if _cfg["fine"] and "_z" in near and abs(t["_bin"] - near["_bin"]) <= FINE_JUMP:
+                            dphi = float(np.angle(t["_z"] * np.conjugate(near["_z"])))
+                            t["vel"] = round(abs(dphi * C / (4 * np.pi * FC)) / dt, 2)   # 2pi per lambda/2
+                        else:
+                            t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)   # crude range delta
                         shown.append(t)
                 for i, t in enumerate(shown):
                     t["id"] = i
-                prev = targets
+                prev = targets                              # keep _z/_bin for next-frame phase
+                pub = [{k: v for k, v in t.items() if not k.startswith("_")} for t in shown]
                 ts = time.monotonic() - t_start
-                _publish(ts, clutter, shown)
-                (_draw_map if _view["map"] else _log)(ts, dbg, clutter, shown)
+                _publish(ts, clutter, pub)
+                (_draw_map if _view["map"] else _log)(ts, dbg, clutter, pub)
 
 
 def sim_loop():
@@ -451,6 +459,8 @@ class Handler(BaseHTTPRequestHandler):
                     _cfg["abs"] = None if v in ("", "auto", "off") else float(v)
                 except ValueError:
                     pass
+            if "fine" in q:                              # toggle phase velocity live
+                _cfg["fine"] = q["fine"][0] in ("1", "true", "on")
             body = json.dumps(_cfg).encode()
         else:
             with _lock:
@@ -479,6 +489,8 @@ if __name__ == "__main__":
     ap.add_argument("--band", choices=["high", "low"], default="high",
                     help="high=17-21kHz near-inaudible; low=8-12kHz audible but far more coherent")
     ap.add_argument("--map", action="store_true", help="live top-down ASCII radar in the terminal")
+    ap.add_argument("--fine", action="store_true",
+                    help="phase-based fine velocity (experimental; default = crude range-delta)")
     ap.add_argument("--selftest", action="store_true", help="synthetic motion-detection check (no hardware)")
     a = ap.parse_args()
 
@@ -488,6 +500,8 @@ if __name__ == "__main__":
         _cfg["snr"] = a.snr
     if a.thresh is not None:
         _cfg["abs"] = a.thresh
+    if a.fine:
+        _cfg["fine"] = True
     if a.selftest:
         motion_selftest()
         sys.exit()
