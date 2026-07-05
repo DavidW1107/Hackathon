@@ -34,7 +34,7 @@ from sonar import FS, C, make_chirp
 
 FRAME_MS = 90                 # long gap so room reverb decays before the next chirp
 PULSES_PER_WIN = 3            # average 3 chirps/window (~0.27 s, ~3.7 Hz) for SNR
-DEVICE = 4                    # ALC285 analog, 2-ch
+DEVICE = 4 if sys.platform.startswith("linux") else None  # ALC285 analog (2-ch) on Linux; None = system default elsewhere
 MIC_BASELINE = 0.10           # m; assumed 2-mic spacing. ponytail: calibrate per laptop.
 PORT = 8765
 FOV = 50                      # forward cone half-angle (deg) we trust azimuth within
@@ -263,7 +263,8 @@ def live_loop():
         idx = (st["tx"] + np.arange(frames)) % flen        # loop the chirp forever
         outdata[:] = tx[idx][:, None]
         st["tx"] = (st["tx"] + frames) % flen
-        q.put(indata.copy())                                # 2-ch capture -> main loop
+        rec = indata if indata.shape[1] == 2 else np.repeat(indata, 2, axis=1)  # mono mic: no azimuth
+        q.put(rec.copy())                                   # 2-ch capture -> main loop
 
     prev = []
     dt = flen / FS                                          # windows advance one ping
@@ -273,7 +274,8 @@ def live_loop():
           f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, {mode})")
     print(f"tune live:  curl 'http://localhost:{PORT}/config?thresh=0.6'   (or ?snr=5, ?thresh=auto)\n")
     buf = np.zeros((0, 2), dtype=np.float32)
-    with sd.Stream(samplerate=FS, channels=2, dtype="float32", device=DEVICE, callback=cb):
+    in_ch = min(2, sd.query_devices(DEVICE, "input")["max_input_channels"])
+    with sd.Stream(samplerate=FS, channels=(in_ch, 2), dtype="float32", device=DEVICE, callback=cb):
         while True:
             buf = np.concatenate([buf, q.get()])
             while len(buf) >= win:

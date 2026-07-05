@@ -96,7 +96,7 @@ class _TopBar extends StatelessWidget {
                   size: 17, weight: FontWeight.w600, spacing: 2.2)),
           const Spacer(),
           StatusPill(
-            label: armed ? 'Live sweep' : 'Standby',
+            label: armed ? 'Scanning' : 'Standby',
             color: armed ? Sentra.green : Sentra.inkDim,
             pulse: armed,
           ),

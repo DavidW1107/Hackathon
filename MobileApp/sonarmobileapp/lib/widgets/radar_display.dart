@@ -1,4 +1,5 @@
 import 'dart:math' as math;
+import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 import '../theme/sentra_theme.dart';
 
@@ -25,8 +26,8 @@ class Blip {
   final bool labelRight;
 }
 
-/// The SONR radar — rings, cross-hairs, a rotating conic sweep, a "SONR"
-/// core, and animated ping blips. Mirrors the landing-page hero radar.
+/// The SONR radar — rings, cross-hairs, an upward-facing scan cone rising
+/// from the "SONR" core, and animated ping blips.
 class RadarDisplay extends StatefulWidget {
   const RadarDisplay({
     super.key,
@@ -43,9 +44,9 @@ class RadarDisplay extends StatefulWidget {
 
 class _RadarDisplayState extends State<RadarDisplay>
     with TickerProviderStateMixin {
-  late final AnimationController _sweep = AnimationController(
+  late final AnimationController _scan = AnimationController(
     vsync: this,
-    duration: const Duration(milliseconds: 4500),
+    duration: const Duration(milliseconds: 3200),
   )..repeat();
 
   late final AnimationController _ping = AnimationController(
@@ -55,7 +56,7 @@ class _RadarDisplayState extends State<RadarDisplay>
 
   @override
   void dispose() {
-    _sweep.dispose();
+    _scan.dispose();
     _ping.dispose();
     super.dispose();
   }
@@ -72,12 +73,12 @@ class _RadarDisplayState extends State<RadarDisplay>
             clipBehavior: Clip.none,
             children: [
               AnimatedBuilder(
-                animation: Listenable.merge([_sweep, _ping]),
+                animation: Listenable.merge([_scan, _ping]),
                 builder: (context, _) {
                   return CustomPaint(
                     size: Size(side, side),
                     painter: _RadarPainter(
-                      sweep: _sweep.value * 2 * math.pi,
+                      scan: _scan.value,
                       ping: _ping.value,
                       armed: widget.armed,
                       blips: widget.blips,
@@ -148,16 +149,21 @@ class _RadarDisplayState extends State<RadarDisplay>
 
 class _RadarPainter extends CustomPainter {
   _RadarPainter({
-    required this.sweep,
+    required this.scan,
     required this.ping,
     required this.armed,
     required this.blips,
   });
 
-  final double sweep;
+  /// Phase (0..1) of the pulses travelling up the scan cone.
+  final double scan;
   final double ping;
   final bool armed;
   final List<Blip> blips;
+
+  /// Half-angle of the scan cone, measured from straight up.
+  static const _halfAngle = math.pi / 5.6; // ~32°
+  static const _up = -math.pi / 2;
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -206,38 +212,61 @@ class _RadarPainter extends CustomPainter {
       axis,
     );
 
-    // rotating conic sweep
+    // upward scan cone rising from the core
     if (armed) {
-      final sweepPaint = Paint()
-        ..shader = SweepGradient(
-          transform: GradientRotation(sweep - math.pi / 2),
-          colors: [
-            Sentra.green.withValues(alpha: 0.42),
-            Sentra.green.withValues(alpha: 0.05),
-            Colors.transparent,
-            Colors.transparent,
-          ],
-          stops: const [0.0, 0.40, 0.55, 1.0],
-        ).createShader(Rect.fromCircle(center: center, radius: r));
-      canvas.drawCircle(center, r, sweepPaint);
+      final bounds = Rect.fromCircle(center: center, radius: r);
+      final cone = Path()
+        ..moveTo(center.dx, center.dy)
+        ..arcTo(bounds, _up - _halfAngle, _halfAngle * 2, false)
+        ..close();
 
-      // bright leading edge
-      final lead = Offset(
-        center.dx + math.cos(sweep - math.pi / 2) * r,
-        center.dy + math.sin(sweep - math.pi / 2) * r,
-      );
-      canvas.drawLine(
-        center,
-        lead,
+      canvas.drawPath(
+        cone,
         Paint()
-          ..strokeWidth = 1.5
-          ..shader = LinearGradient(
+          ..shader = RadialGradient(
             colors: [
-              Sentra.greenBright.withValues(alpha: 0.7),
+              Sentra.green.withValues(alpha: 0.42),
+              Sentra.green.withValues(alpha: 0.10),
               Colors.transparent,
             ],
-          ).createShader(Rect.fromPoints(center, lead)),
+            stops: const [0.0, 0.55, 1.0],
+          ).createShader(bounds),
       );
+
+      // bright cone edges
+      for (final angle in [_up - _halfAngle, _up + _halfAngle]) {
+        final tip = Offset(
+          center.dx + math.cos(angle) * r,
+          center.dy + math.sin(angle) * r,
+        );
+        canvas.drawLine(
+          center,
+          tip,
+          Paint()
+            ..strokeWidth = 1.5
+            ..shader = ui.Gradient.linear(center, tip, [
+              Sentra.greenBright.withValues(alpha: 0.7),
+              Colors.transparent,
+            ]),
+        );
+      }
+
+      // pulses travelling up the cone
+      for (int i = 0; i < 3; i++) {
+        final phase = (scan + i / 3) % 1.0;
+        final pulseR = phase * r;
+        if (pulseR < 10) continue;
+        canvas.drawArc(
+          Rect.fromCircle(center: center, radius: pulseR),
+          _up - _halfAngle,
+          _halfAngle * 2,
+          false,
+          Paint()
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 1.5
+            ..color = Sentra.greenBright.withValues(alpha: (1 - phase) * 0.5),
+        );
+      }
     }
 
     // blips
@@ -275,5 +304,5 @@ class _RadarPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_RadarPainter old) =>
-      old.sweep != sweep || old.ping != ping || old.armed != armed;
+      old.scan != scan || old.ping != ping || old.armed != armed;
 }

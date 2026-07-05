@@ -3,42 +3,65 @@ import '../theme/sentra_theme.dart';
 import '../widgets/radar_display.dart';
 import '../widgets/sentra_widgets.dart';
 
-class RadarScreen extends StatelessWidget {
+class RadarScreen extends StatefulWidget {
   const RadarScreen({super.key, required this.armed});
 
   final bool armed;
 
+  @override
+  State<RadarScreen> createState() => _RadarScreenState();
+}
+
+class _RadarScreenState extends State<RadarScreen> {
+  // Detection distance gate, in metres. Anything at or beyond
+  // [_maxDistance] means "Max" — no cap; the sonar sweeps its full range.
+  // This value is what gets pushed to the sonar station (sensor.py
+  // MAX_RANGE) once the app is wired up.
+  static const _minDistance = 0.4; // 40 cm
+  static const _maxDistance = 4.0;
+  double _distance = 3.1;
+
+  bool get _atMax => _distance >= _maxDistance;
+
+  String get _distanceLabel => _atMax
+      ? 'Max'
+      : _distance < 1.0
+          ? '${(_distance * 100).round()} cm'
+          : '${_distance.toStringAsFixed(1)} m';
+
+  // Positions sit inside the upward scan cone (~32° either side of vertical).
   static const _blips = [
     Blip(
-      dx: 0.40,
-      dy: -0.40,
+      dx: 0.30,
+      dy: -0.52,
       color: Sentra.greenBright,
       pingOffset: 0.0,
       label: '◦ presence · 2.4m',
     ),
     Blip(
-      dx: -0.48,
-      dy: 0.28,
+      dx: -0.32,
+      dy: -0.62,
       color: Sentra.amber,
       pingOffset: 0.45,
       label: 'unknown device ◦',
       labelRight: true,
     ),
-    Blip(dx: 0.24, dy: 0.46, color: Sentra.green, pingOffset: 0.7),
+    Blip(dx: 0.06, dy: -0.32, color: Sentra.green, pingOffset: 0.7),
   ];
 
   @override
   Widget build(BuildContext context) {
+    final armed = widget.armed;
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
       children: [
-        const Kicker('02 · Live sweep'),
+        const Kicker('02 · Scanning'),
         const SizedBox(height: 10),
         Text('Room A4', style: Sentra.display(size: 30, height: 1.05)),
         const SizedBox(height: 6),
         Text(
           armed
-              ? 'Sweeping the space around this station. Blips are reflectors picked out of the static room.'
+              ? 'Projecting an acoustic cone up from this station. Blips are reflectors picked out of the static room.'
               : 'Station on standby. Arm it to resume the acoustic sweep.',
           style: Sentra.sans(size: 13.5, height: 1.55),
         ),
@@ -48,33 +71,67 @@ class RadarScreen extends StatelessWidget {
           child: RadarDisplay(blips: armed ? _blips : const [], armed: armed),
         ),
         const SizedBox(height: 28),
-        _readouts(),
+        _distanceSlider(),
         const SizedBox(height: 16),
         _lastEvent(),
       ],
     );
   }
 
-  Widget _readouts() {
+  Widget _distanceSlider() {
     return Panel(
-      padding: const EdgeInsets.symmetric(vertical: 22, horizontal: 20),
+      padding: const EdgeInsets.fromLTRB(18, 16, 18, 10),
       borderColor: Sentra.lineGreen,
       color: Sentra.bgRaise,
-      child: Row(
-        children: const [
-          Expanded(
-            child: StatTile(value: '40', unit: 'kHz', label: 'Sweep freq'),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text('DETECTION DISTANCE',
+                  style: Sentra.mono(
+                      size: 9.5, color: Sentra.inkDim, spacing: 1.4)),
+              const Spacer(),
+              Text(_distanceLabel,
+                  style: Sentra.mono(
+                      size: 12,
+                      color: Sentra.greenBright,
+                      weight: FontWeight.w600)),
+            ],
           ),
-          _Divider(),
-          Expanded(
-            child: StatTile(value: '3.1', unit: 'm', label: 'Range gate'),
+          const SizedBox(height: 4),
+          SliderTheme(
+            data: SliderThemeData(
+              trackHeight: 7,
+              trackShape: const RectangularSliderTrackShape(),
+              activeTrackColor: Sentra.green,
+              inactiveTrackColor: Sentra.lineWhite,
+              thumbColor: Sentra.greenBright,
+              overlayColor: Sentra.green.withValues(alpha: 0.12),
+              thumbShape: const _BlockThumbShape(),
+              tickMarkShape: SliderTickMarkShape.noTickMark,
+              overlayShape:
+                  const RoundSliderOverlayShape(overlayRadius: 18),
+            ),
+            child: Slider(
+              value: _distance,
+              min: _minDistance,
+              max: _maxDistance,
+              divisions:
+                  ((_maxDistance - _minDistance) / 0.1).round(), // 10 cm steps
+              onChanged: (v) => setState(() => _distance = v),
+            ),
           ),
-          _Divider(),
-          Expanded(
-            child: StatTile(
-              value: '2',
-              label: 'Targets',
-              valueColor: Sentra.amber,
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 4),
+            child: Row(
+              children: [
+                Text('40 cm',
+                    style: Sentra.mono(size: 9, color: Sentra.inkFaint)),
+                const Spacer(),
+                Text('MAX',
+                    style: Sentra.mono(size: 9, color: Sentra.inkFaint)),
+              ],
             ),
           ),
         ],
@@ -121,11 +178,4 @@ class RadarScreen extends StatelessWidget {
       ),
     );
   }
-}
-
-class _Divider extends StatelessWidget {
-  const _Divider();
-  @override
-  Widget build(BuildContext context) =>
-      Container(width: 1, height: 40, color: Sentra.lineGreen);
 }

@@ -110,18 +110,6 @@ class _StationScreenState extends State<StationScreen> {
             ],
           ),
         ),
-        const SizedBox(height: 16),
-
-        // metrics
-        Row(
-          children: [
-            Expanded(child: _metric('<300', 'ms', 'Detection')),
-            const SizedBox(width: 12),
-            Expanded(child: _metric('4.2', 'h', 'Uptime')),
-            const SizedBox(width: 12),
-            Expanded(child: _metric('100', '%', 'On-device')),
-          ],
-        ),
         const SizedBox(height: 28),
 
         // settings
@@ -174,17 +162,6 @@ class _StationScreenState extends State<StationScreen> {
       ],
     );
   }
-
-  Widget _metric(String v, String unit, String label) => Panel(
-        padding: const EdgeInsets.symmetric(vertical: 18, horizontal: 14),
-        borderColor: Sentra.lineGreen,
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            StatTile(value: v, unit: unit, label: label),
-          ],
-        ),
-      );
 
   Widget _rowDivider() =>
       Container(height: 1, color: Sentra.lineWhite);

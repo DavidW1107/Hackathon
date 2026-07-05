@@ -2,194 +2,170 @@ import 'package:flutter/material.dart';
 import '../theme/sentra_theme.dart';
 import '../widgets/sentra_widgets.dart';
 
-/// One coloured token in a terminal line.
-class _Tok {
-  const _Tok(this.text, this.color, {this.weight = FontWeight.w400});
-  final String text;
+/// One entry in the activity feed, in plain English.
+class _Event {
+  const _Event({
+    required this.icon,
+    required this.color,
+    required this.title,
+    required this.detail,
+    required this.time,
+    this.isAlert = false,
+  });
+
+  final IconData icon;
   final Color color;
-  final FontWeight weight;
+  final String title;
+  final String detail;
+  final String time;
+  final bool isAlert;
 }
 
 class EventsScreen extends StatelessWidget {
   const EventsScreen({super.key});
 
-  static final _dim = Sentra.inkFaint;
-  static const _grn = Sentra.green;
-  static const _brt = Sentra.greenBright;
-  static const _amb = Sentra.amber;
-  static const _ink = Sentra.ink;
-
-  List<List<_Tok>> get _log => [
-        [_Tok('[13:58:02] ', _dim), _Tok('sweep 0397 ', _grn),
-            _Tok('· ', _dim), _Tok('baseline locked', _ink)],
-        [_Tok('[13:58:04] ', _dim), _Tok('MTI subtraction ', _ink),
-            _Tok('· ', _dim), _Tok('static field clear', _grn)],
-        [_Tok('[13:58:07] ', _dim), _Tok('Δ echo 2.4m ', _brt),
-            _Tok('· ', _dim), _Tok('bearing 041° ', _ink),
-            _Tok('· ', _dim), _Tok('presence', _brt)],
-        [_Tok('[13:58:07] ', _dim), _Tok('ALERT ', _amb, weight: FontWeight.w600),
-            _Tok('→ ', _dim), _Tok('push sent · snapshot saved', _ink)],
-        [_Tok('[13:58:12] ', _dim), _Tok('range-gate 3.1m ', _ink),
-            _Tok('· ', _dim), _Tok('profile aligned', _grn)],
-        [_Tok('[13:58:15] ', _dim), _Tok('echo cleared ', _ink),
-            _Tok('· ', _dim), _Tok('rearmed', _grn)],
-        [_Tok('[13:58:18] ', _dim), _Tok('sweep 0398 ', _grn),
-            _Tok('· ', _dim), _Tok('baseline locked', _ink)],
-        [_Tok('[13:58:21] ', _dim), _Tok('cadence match 98.2% ', _brt),
-            _Tok('· ', _dim), _Tok('login accepted', _ink)],
-      ];
+  static const _events = [
+    _Event(
+      icon: Icons.person_outline,
+      color: Sentra.greenBright,
+      title: 'You were recognized',
+      detail: 'Walking pattern matched — welcome home.',
+      time: '1:58 PM',
+    ),
+    _Event(
+      icon: Icons.check_circle_outline,
+      color: Sentra.green,
+      title: 'Back to normal',
+      detail: 'Movement stopped. Monitoring resumed.',
+      time: '1:58 PM',
+    ),
+    _Event(
+      icon: Icons.notifications_active_outlined,
+      color: Sentra.amber,
+      title: 'Alert sent to your phone',
+      detail: 'A snapshot was saved on this device.',
+      time: '1:58 PM',
+      isAlert: true,
+    ),
+    _Event(
+      icon: Icons.directions_walk,
+      color: Sentra.amber,
+      title: 'Movement detected',
+      detail: 'Something moved about 2.4 m from the sensor.',
+      time: '1:58 PM',
+      isAlert: true,
+    ),
+    _Event(
+      icon: Icons.radar,
+      color: Sentra.green,
+      title: 'Room scanned',
+      detail: 'Everything looked normal.',
+      time: '1:58 PM',
+    ),
+  ];
 
   @override
   Widget build(BuildContext context) {
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
       children: [
-        const Kicker('Event log'),
+        const Kicker('Activity'),
         const SizedBox(height: 10),
-        Text('Echo receipts', style: Sentra.display(size: 30, height: 1.05)),
-        const SizedBox(height: 6),
-        Text(
-          'A timestamped, on-device record of every sweep and detection. '
-          'Nothing but echoes ever leaves the station.',
-          style: Sentra.sans(size: 13.5, height: 1.55),
-        ),
+        Text('What happened today',
+            style: Sentra.display(size: 30, height: 1.05)),
         const SizedBox(height: 22),
-        _terminal(),
-        const SizedBox(height: 18),
-        Row(
-          children: [
-            Expanded(child: _tally('4', 'SWEEPS', Sentra.green)),
-            const SizedBox(width: 12),
-            Expanded(child: _tally('1', 'ALERTS', Sentra.amber)),
-            const SizedBox(width: 12),
-            Expanded(child: _tally('0', 'PENDING', Sentra.inkDim)),
-          ],
+        _statusBanner(),
+        const SizedBox(height: 26),
+        const Kicker('Today', color: Sentra.inkDim),
+        const SizedBox(height: 12),
+        for (final e in _events) ...[
+          _eventCard(e),
+          const SizedBox(height: 10),
+        ],
+        const SizedBox(height: 10),
+        Center(
+          child: Text(
+            'All activity stays on this device — nothing is uploaded.',
+            textAlign: TextAlign.center,
+            style: Sentra.sans(size: 12, color: Sentra.inkFaint),
+          ),
         ),
       ],
     );
   }
 
-  Widget _terminal() {
+  Widget _statusBanner() {
     return Panel(
-      padding: EdgeInsets.zero,
-      color: Sentra.terminal,
+      padding: const EdgeInsets.all(18),
       borderColor: Sentra.lineGreenMid,
-      radius: 12,
       glow: true,
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
+      child: Row(
         children: [
-          // title bar
           Container(
-            padding: const EdgeInsets.fromLTRB(14, 11, 14, 11),
-            decoration: const BoxDecoration(
-              color: Sentra.bgPanel,
-              border: Border(bottom: BorderSide(color: Sentra.lineGreen)),
-              borderRadius: BorderRadius.vertical(top: Radius.circular(12)),
+            width: 44,
+            height: 44,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: Sentra.green.withValues(alpha: 0.12),
             ),
-            child: Row(
-              children: [
-                _dot(Sentra.green.withValues(alpha: 0.55)),
-                _dot(Colors.white.withValues(alpha: 0.12)),
-                _dot(Colors.white.withValues(alpha: 0.12)),
-                const Spacer(),
-                Text('sonr --watch --map',
-                    style: Sentra.mono(
-                        size: 10, color: Sentra.inkFaint, spacing: 1.2)),
-              ],
-            ),
+            child: const Icon(Icons.shield_outlined,
+                size: 22, color: Sentra.green),
           ),
-          // body
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 18),
+          const SizedBox(width: 14),
+          Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                for (final line in _log)
-                  Padding(
-                    padding: const EdgeInsets.only(bottom: 7),
-                    child: RichText(
-                      text: TextSpan(
-                        children: [
-                          for (final t in line)
-                            TextSpan(
-                              text: t.text,
-                              style: Sentra.mono(
-                                  size: 11.5,
-                                  color: t.color,
-                                  weight: t.weight,
-                                  height: 1.5),
-                            ),
-                        ],
-                      ),
-                    ),
-                  ),
-                Row(children: [
-                  Text('_',
-                      style:
-                          Sentra.mono(size: 11.5, color: Sentra.green)),
-                  const _Caret(),
-                ]),
+                Text('All clear right now',
+                    style: Sentra.sans(
+                        size: 15.5, weight: FontWeight.w600, color: Sentra.ink)),
+                const SizedBox(height: 3),
+                Text('SENTRA is watching your space.',
+                    style: Sentra.sans(size: 12.5)),
               ],
             ),
           ),
+          const StatusPill(label: 'Live'),
         ],
       ),
     );
   }
 
-  Widget _dot(Color c) => Container(
-        margin: const EdgeInsets.only(right: 8),
-        width: 10,
-        height: 10,
-        decoration: BoxDecoration(shape: BoxShape.circle, color: c),
-      );
-
-  Widget _tally(String n, String label, Color color) {
+  Widget _eventCard(_Event e) {
     return Panel(
-      padding: const EdgeInsets.symmetric(vertical: 18),
-      borderColor: Sentra.lineGreen,
-      child: Column(
+      padding: const EdgeInsets.all(14),
+      borderColor: e.isAlert
+          ? Sentra.amber.withValues(alpha: 0.35)
+          : Sentra.lineWhite,
+      child: Row(
         children: [
-          Text(n, style: Sentra.display(size: 26, color: color)),
-          const SizedBox(height: 6),
-          Text(label,
-              style: Sentra.mono(size: 9.5, color: Sentra.inkDim, spacing: 1.4)),
+          Container(
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+              shape: BoxShape.circle,
+              color: e.color.withValues(alpha: 0.12),
+            ),
+            child: Icon(e.icon, size: 19, color: e.color),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(e.title,
+                    style: Sentra.sans(
+                        size: 14, weight: FontWeight.w600, color: Sentra.ink)),
+                const SizedBox(height: 3),
+                Text(e.detail, style: Sentra.sans(size: 12.5, height: 1.4)),
+              ],
+            ),
+          ),
+          const SizedBox(width: 10),
+          Text(e.time,
+              style: Sentra.mono(size: 10, color: Sentra.inkFaint)),
         ],
       ),
     );
   }
-}
-
-class _Caret extends StatefulWidget {
-  const _Caret();
-  @override
-  State<_Caret> createState() => _CaretState();
-}
-
-class _CaretState extends State<_Caret> with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 1100),
-  )..repeat();
-
-  @override
-  void dispose() {
-    _c.dispose();
-    super.dispose();
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return FadeTransition(
-      opacity: _c.drive(_BlinkTween()),
-      child: Container(width: 8, height: 15, color: Sentra.green),
-    );
-  }
-}
-
-/// Hard on/off blink like the site's step-end cursor.
-class _BlinkTween extends Animatable<double> {
-  @override
-  double transform(double t) => t < 0.5 ? 1 : 0;
 }

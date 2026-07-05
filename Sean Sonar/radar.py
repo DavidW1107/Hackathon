@@ -16,21 +16,27 @@ straight ahead at equal path lengths look identical) -- this is a planar
 projection, not full 3D.
 
 Usage:
-    python radar.py            live radar view
-    python radar.py --log      scrolling text log instead of the radar
-    python radar.py --debug    extra per-channel numbers (implies --log)
+    python radar.py                live radar view
+    python radar.py --log          scrolling text log instead of the radar
+    python radar.py --debug        extra per-channel numbers (implies --log)
+    python radar.py --json         one JSON object per frame on stdout
+    python radar.py --udp H:P      also stream the JSON over UDP
+    python radar.py --simulate     synthetic scene, no audio hardware
 
 Keep your hands away from the laptop during the ~2 s calibration.
 """
 
 import argparse
+import json
 import queue
+import socket
 import sys
 import time
 from collections import deque
 
 import numpy as np
-import sounddevice as sd
+
+import echo_core as ec
 
 # ---------------------------- configuration ---------------------------------
 FS          = 48_000            # sample rate (Hz)
@@ -42,21 +48,20 @@ PING_PERIOD = 0.100             # one ping every 100 ms -> 10 frames/s
 VOLUME      = 0.6               # per-channel output amplitude (0..1)
 C           = 343.0             # speed of sound (m/s)
 CAL_PINGS   = 20                # pings used to learn the static background
-SNR_THRESH  = 6.0               # detection threshold (x noise sigma)
+SNR_ENTER   = 6.0               # a NEW object must clear this (x noise sigma)
+SNR_EXIT    = 4.0               # a tracked object survives down to this
 ABS_FLOOR   = 0.002             # min echo strength relative to direct path
 BG_ADAPT    = 0.02              # slow background adaptation rate
 BG_FAST     = 0.30              # absorption rate of confirmed-stale residue
 REF_ADAPT   = 0.05              # direct-path reference tracking rate
 EMA_A       = 0.20              # temporal-coherence smoothing per frame
 COH_STALE   = 0.95              # residue coherence above this = static scene
-                                # change, not a live target
 STALE_RUN   = 20                # frames coherence must stay high before
                                 # absorbing -- longer than the still moment
                                 # at the extremes of a breath (~1 s)
-SIDE_REJ    = 0.10              # backstop: secondary peaks below this fraction
-                                # of the strongest are leftover fit error
+SIDE_REJ    = 0.10              # secondary peaks below this fraction of the
+                                # strongest are leftover fit error
 MAX_OBJ     = 3                 # max simultaneous reflectors
-SUB         = 32                # sub-sample resolution of the echo templates
 
 # geometry (metres, in the keyboard plane; tweak for your machine)
 SPK_L_X     = -0.12             # left speaker x
@@ -67,192 +72,37 @@ MIN_E       = 0.04              # min bistatic extra path (m)
 MAX_E       = 2.30              # max bistatic extra path (m)
 # -----------------------------------------------------------------------------
 
-PING_N  = int(FS * PING_PERIOD)
-CHIRP_N = int(FS * CHIRP_DUR)
-WIN_N   = 2 * PING_N
-CORR_N  = WIN_N - CHIRP_N + 1
-NFFT    = 1 << (WIN_N + CHIRP_N).bit_length()
-MIN_LAG = int(round(MIN_E / C * FS))
-MAX_LAG = int(round(MAX_E / C * FS))
-
-
-def make_chirp(f0: float, f1: float) -> tuple[np.ndarray, np.ndarray]:
-    """Real transmit chirp and the FFT-conjugate of its analytic version."""
-    t = np.arange(CHIRP_N) / FS
-    phase = 2 * np.pi * (f0 * t + (f1 - f0) / (2 * CHIRP_DUR) * t**2)
-    win = np.hanning(CHIRP_N)
-    tx = (VOLUME * np.sin(phase) * win).astype(np.float32)
-    analytic = np.exp(1j * phase) * win
-    return tx, np.conj(np.fft.fft(analytic, NFFT))
-
+CFG = ec.EchoConfig(
+    fs=FS, f0=BAND[0], f1=BAND[1], chirp_dur=CHIRP_DUR,
+    ping_period=PING_PERIOD, volume=VOLUME,
+    min_lag=int(round(MIN_E / C * FS)),
+    max_lag=int(round(MAX_E / C * FS)),
+    cal_pings=CAL_PINGS, snr_enter=SNR_ENTER, snr_exit=SNR_EXIT,
+    abs_floor=ABS_FLOOR, bg_adapt=BG_ADAPT, bg_fast=BG_FAST,
+    ref_adapt=REF_ADAPT, ema_a=EMA_A, coh_stale=COH_STALE,
+    stale_run=STALE_RUN, max_obj=MAX_OBJ, side_rej=SIDE_REJ)
 
 # column 0 = left speaker (up-chirp at t=0), column 1 = right speaker
 # (down-chirp half a ping later). Full band for both -> best range
 # resolution; time offset + opposite sweeps keep the channels separable.
-TX = np.zeros((PING_N, 2), dtype=np.float32)
-TX[:CHIRP_N, 0], H_L = make_chirp(BAND[0], BAND[1])
-_half = PING_N // 2
-TX[_half:_half + CHIRP_N, 1], H_R = make_chirp(BAND[1], BAND[0])
+TX = np.zeros((CFG.ping_n, 2), dtype=np.float32)
+_burst_l, H_L = ec.make_chirp(CFG, BAND[0], BAND[1])
+_burst_r, H_R = ec.make_chirp(CFG, BAND[1], BAND[0])
+_half = CFG.ping_n // 2
+TX[:CFG.chirp_n, 0] = _burst_l
+TX[_half:_half + CFG.chirp_n, 1] = _burst_r
+TMPL_L0 = ec.subsample_bank(CFG, ec.ideal_lobe(CFG, _burst_l, H_L))
+TMPL_R0 = ec.subsample_bank(CFG, ec.ideal_lobe(CFG, _burst_r, H_R))
 
 
-def make_templates(chirp: np.ndarray, h_conj: np.ndarray) -> np.ndarray:
-    """Complex matched-filter response of a unit echo, tabulated at SUB
-    sub-sample shifts. Row s, column CHIRP_N + u = response at integer lag u
-    for an echo delayed by (s - SUB/2)/SUB of a sample. Used to CLEAN each
-    detected echo's full correlation lobe (skirts, image-term ripple and all)
-    out of the residual before searching for the next object."""
-    chirp_f = np.fft.fft(chirp.astype(np.float64), NFFT)
-    freqs = np.fft.fftfreq(NFFT)
-    tbl = np.empty((SUB, 2 * CHIRP_N + 1), dtype=complex)
-    for s in range(SUB):
-        delta = (s - SUB // 2) / SUB
-        resp = np.fft.ifft(chirp_f * h_conj *
-                           np.exp(-2j * np.pi * freqs * delta))
-        tbl[s] = np.concatenate([resp[-CHIRP_N:], resp[:CHIRP_N + 1]])
-    return tbl
-
-
-TMPL_L = make_templates(TX[:CHIRP_N, 0], H_L)
-TMPL_R = make_templates(TX[_half:_half + CHIRP_N, 1], H_R)
-
-
-class Channel:
-    """One speaker's echo profile: coherent background subtraction + peaks.
-
-    Same pipeline as sonar.py's 1D processor, generalized to return every
-    detected echo as a bistatic extra-path length in metres.
-    """
-
-    def __init__(self, name: str, h_conj: np.ndarray,
-                 tmpl: np.ndarray) -> None:
-        self.name = name
-        self.h_conj = h_conj
-        self.tmpl = tmpl
-        self.direct: int | None = None
-        self.ref: complex = 0j
-        self.cal: list[np.ndarray] = []
-        self.cal_ref: list[complex] = []
-        self.bg: np.ndarray | None = None
-        self.med = 0.0                  # noise floor, learned at calibration
-        self.sigma = 1e-9
-        self.ema_c: np.ndarray | None = None  # complex residual average
-        self.ema_m: np.ndarray | None = None  # residual magnitude average
-        self.stale_run: np.ndarray | None = None  # consecutive high-coh frames
-
-    def process(self, X: np.ndarray) -> dict:
-        corr = np.fft.ifft(X * self.h_conj)[:CORR_N]
-        mag = np.abs(corr[:PING_N])
-        p = int(np.argmax(mag))
-        if mag[p] < 1e-6 or mag[p] < 20 * np.median(mag):
-            return {"state": "silent"}
-
-        if self.direct is None or mag[p] > 2 * mag[self.direct]:
-            self.direct = p
-            self.cal.clear()
-            self.cal_ref.clear()
-            self.bg = None
-
-        d = self.direct
-        if self.bg is None:
-            self.cal.append(corr[d + MIN_LAG: d + MAX_LAG].copy())
-            self.cal_ref.append(complex(corr[d]))
-            if len(self.cal) >= CAL_PINGS:
-                self.ref = np.mean(self.cal_ref)
-                self.bg = np.mean(self.cal, axis=0) / self.ref
-                # noise floor from the (echo-free) calibration residuals --
-                # a per-frame estimate would be inflated by the echoes we
-                # are trying to detect
-                pool = np.concatenate(
-                    [np.abs(c / self.ref - self.bg) for c in self.cal])
-                self.med = float(np.median(pool))
-                self.sigma = float(
-                    1.4826 * np.median(np.abs(pool - self.med))) + 1e-9
-                self.ema_c = np.zeros(len(self.bg), dtype=complex)
-                self.ema_m = np.zeros(len(self.bg))
-                self.stale_run = np.zeros(len(self.bg))
-                self.cal.clear()
-                self.cal_ref.clear()
-            return {"state": "calibrating"}
-
-        # slow-tracked reference: a close hand perturbs the instantaneous
-        # direct-path value, which must not rescale the whole profile
-        seg = corr[d + MIN_LAG: d + MAX_LAG] / self.ref
-        self.ref = (1 - REF_ADAPT) * self.ref + REF_ADAPT * corr[d]
-
-        cres = seg - self.bg             # complex residual
-        resid = np.abs(cres)
-        resid0 = resid                   # pre-CLEAN copy, for adaptation
-        n = len(cres)
-
-        # Temporal coherence per bin: |mean(residual)| / mean(|residual|).
-        # Live targets wander in phase ping to ping (breathing alone is
-        # >1 rad here); leftover static residue is phase-frozen (coh ~ 1).
-        self.ema_c = (1 - EMA_A) * self.ema_c + EMA_A * cres
-        self.ema_m = (1 - EMA_A) * self.ema_m + EMA_A * resid
-        coh = np.abs(self.ema_c) / (self.ema_m + 1e-12)
-
-        loud = resid0 > self.med + 4 * self.sigma
-        # "stale" requires SUSTAINED phase-frozen amplitude: the ema_m
-        # gate keeps a freshly appeared target (whose EMAs are dominated by
-        # one frame, faking coherence 1) from qualifying, and the run
-        # counter keeps the brief still moments of a breathing person from
-        # qualifying -- only residue frozen for ~2 s straight is absorbed
-        high = loud & (coh > COH_STALE) & (self.ema_m > 0.7 * resid0)
-        self.stale_run = np.where(high, self.stale_run + 1, 0)
-        stale = self.stale_run >= STALE_RUN
-
-        # CLEAN: detect the strongest live echo, fit its exact complex lobe
-        # (sub-sample position + amplitude), subtract it, repeat
-        peaks = []                       # (extra path m, snr, amp)
-        killed = np.zeros(n, dtype=bool)
-        for _ in range(MAX_OBJ):
-            i = int(np.argmax(np.where(killed | stale, 0.0, resid)))
-            amp = float(resid[i])
-            snr = float((amp - self.med) / self.sigma)
-            if snr < SNR_THRESH or amp < ABS_FLOOR:
-                break
-            if peaks and amp < SIDE_REJ * peaks[0][2]:
-                break
-            best = None
-            for s in range(SUB):         # least-squares over sub-sample shift
-                T = self.tmpl[s][CHIRP_N - i: CHIRP_N - i + n] / self.ref
-                lo, hi = max(i - 45, 0), min(i + 46, n)
-                tn, cn = T[lo:hi], cres[lo:hi]
-                a = np.vdot(tn, cn) / (float(np.vdot(tn, tn).real) + 1e-18)
-                err = float(np.sum(np.abs(cn - a * tn) ** 2))
-                if best is None or err < best[0]:
-                    best = (err, s, a, T)
-            _, s, a, T = best
-            lag = MIN_LAG + i + (s - SUB // 2) / SUB
-            peaks.append((lag / FS * C, snr, amp))
-            cres = cres - a * T          # remove this echo's entire lobe
-            resid = np.abs(cres)
-            killed[max(i - 6, 0): i + 7] = True
-
-        # background update rates by bin class: fast absorption of
-        # phase-frozen residue, normal drift far from any activity, and
-        # NEVER absorb a live target or its surrounding correlation skirt
-        # -- a person standing still must stay visible indefinitely, and
-        # nothing of them may leak into the background to resurface as a
-        # phantom when they leave
-        protect = np.convolve((loud & ~stale).astype(float),
-                              np.ones(91), "same") > 0
-        rate = np.where(stale, BG_FAST,
-                        np.where(protect | loud, 0.0, BG_ADAPT))
-        self.bg = self.bg + rate * (seg - self.bg)
-
-        # the noise floor may drift only while nothing is detected, so a
-        # present target can never ratchet it up over itself
-        if not peaks:
-            q = resid0[~loud]
-            if len(q) > 40:
-                m = np.median(q)
-                s = 1.4826 * np.median(np.abs(q - m)) + 1e-9
-                self.med += 0.1 * (m - self.med)
-                self.sigma += 0.1 * (s - self.sigma)
-
-        return {"state": "ok", "peaks": [(e, s) for e, s, _ in peaks],
-                "med": self.med, "sigma": self.sigma}
+def mic_skew_cm(dl: int, dr: int) -> float:
+    """Mic x implied by the two direct-path arrivals. The right chirp is
+    transmitted half a ping late, so that offset must come out of the
+    raw index difference before it means anything geometric."""
+    raw = (dl - dr + _half) % CFG.ping_n
+    if raw >= CFG.ping_n // 2:
+        raw -= CFG.ping_n
+    return raw / FS * C / 2 * 100
 
 
 # ------------------------- 2D localization ----------------------------------
@@ -283,29 +133,43 @@ class Radar:
     """Fuses both channels into tracked 2D objects."""
 
     def __init__(self) -> None:
-        self.ch_l = Channel("L", H_L, TMPL_L)
-        self.ch_r = Channel("R", H_R, TMPL_R)
+        self.ch_l = ec.Channel(CFG, H_L, TMPL_L0, "L")
+        self.ch_r = ec.Channel(CFG, H_R, TMPL_R0, "R")
         self.tracks: list[dict] = []
 
+    def note_xrun(self) -> None:
+        self.ch_l.note_xrun()
+        self.ch_r.note_xrun()
+
     def process(self, window: np.ndarray) -> dict:
-        X = np.fft.fft(window, NFFT)
+        X = np.fft.fft(window, CFG.nfft)
         rl, rr = self.ch_l.process(X), self.ch_r.process(X)
         states = {rl["state"], rr["state"]}
         if "silent" in states:
             return {"state": "silent"}
+        if "relock" in states:
+            self.tracks.clear()
+            return {"state": "calibrating"}
         if "calibrating" in states:
             return {"state": "calibrating"}
 
-        objs = self._fuse(rl["peaks"], rr["peaks"])
+        # a 'blip' channel (glitch / level change settling) contributes no
+        # peaks this frame; existing tracks coast through on their miss budget
+        peaks_l = [(d["lag"] / FS * C, d["snr"]) for d in rl.get("peaks", [])]
+        peaks_r = [(d["lag"] / FS * C, d["snr"]) for d in rr.get("peaks", [])]
+        objs = self._fuse(peaks_l, peaks_r)
         self._track(objs)
-        live = [t for t in self.tracks if t["miss"] == 0]
+        # confirmation: one-frame wonders (ghost L/R pairings) never show
+        live = [t for t in self.tracks if t["miss"] <= 1 and t["hits"] >= 2]
         return {"state": "ok", "objects": live, "raw": (rl, rr)}
 
     def _fuse(self, peaks_l: list, peaks_r: list) -> list[dict]:
         """Pair per-speaker echoes by path similarity, intersect ellipses."""
         objs = []
         used_r: set[int] = set()
-        for e_l, snr_l in sorted(peaks_l, key=lambda p: -p[1]):
+        order = sorted(range(len(peaks_l)), key=lambda i: -peaks_l[i][1])
+        for i in order:
+            e_l, snr_l = peaks_l[i]
             best, best_diff = None, 0.35    # max plausible L/R path spread
             for j, (e_r, snr_r) in enumerate(peaks_r):
                 if j not in used_r and abs(e_l - e_r) < best_diff:
@@ -313,6 +177,12 @@ class Radar:
             if best is None:
                 continue
             e_r, snr_r = peaks_r[best]
+            # mutuality: if that right-channel echo sits closer to some
+            # other left-channel echo, pairing it with this one would
+            # stitch two different objects into a ghost
+            if any(k != i and abs(peaks_l[k][0] - e_r) < best_diff
+                   for k in range(len(peaks_l))):
+                continue
             x, z, res = localize(e_l, e_r)
             if res < 0.07:                  # ellipses must actually intersect
                                             # (loosely: an extended body's L/R
@@ -322,21 +192,31 @@ class Radar:
         return objs
 
     def _track(self, objs: list[dict]) -> None:
-        """Nearest-neighbour tracking with light smoothing."""
+        """Nearest-neighbour tracking with light smoothing and hysteresis:
+        known objects survive down to SNR_EXIT, new ones need SNR_ENTER."""
         for t in self.tracks:
             t["miss"] += 1
-        for o in objs:
-            near = min(self.tracks,
-                       key=lambda t: np.hypot(t["x"] - o["x"], t["z"] - o["z"]),
-                       default=None)
-            if near is not None and near["miss"] > 0 and \
-                    np.hypot(near["x"] - o["x"], near["z"] - o["z"]) < 0.15:
-                near["x"] = 0.5 * near["x"] + 0.5 * o["x"]
-                near["z"] = 0.5 * near["z"] + 0.5 * o["z"]
-                near["snr"], near["miss"] = o["snr"], 0
-            else:
-                self.tracks.append({**o, "miss": 0})
-        self.tracks = [t for t in self.tracks if t["miss"] <= 1]
+        claimed: set[int] = set()
+        for o in sorted(objs, key=lambda o: -o["snr"]):
+            best = None
+            for k, t in enumerate(self.tracks):
+                if k in claimed:
+                    continue
+                d = float(np.hypot(t["x"] - o["x"], t["z"] - o["z"]))
+                if d < 0.15 and (best is None or d < best[1]):
+                    best = (k, d)
+            if best is not None:
+                k = best[0]
+                claimed.add(k)
+                t = self.tracks[k]
+                t["x"] = 0.5 * t["x"] + 0.5 * o["x"]
+                t["z"] = 0.5 * t["z"] + 0.5 * o["z"]
+                t["snr"], t["miss"] = o["snr"], 0
+                t["hits"] += 1
+            elif o["snr"] >= SNR_ENTER:
+                self.tracks.append({**o, "miss": 0, "hits": 1})
+                claimed.add(len(self.tracks) - 1)
+        self.tracks = [t for t in self.tracks if t["miss"] <= 3]
 
 
 # ------------------------------ display -------------------------------------
@@ -392,36 +272,150 @@ def render(status: str, objects: list[dict], trail: deque) -> str:
 
 # -------------------------------- main ---------------------------------------
 def main() -> None:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--log", action="store_true",
                     help="scrolling text output instead of the radar view")
     ap.add_argument("--debug", action="store_true",
                     help="per-channel diagnostics (implies --log)")
+    ap.add_argument("--json", action="store_true",
+                    help="one JSON object per frame on stdout (implies --log)")
+    ap.add_argument("--udp", metavar="HOST:PORT",
+                    help="also stream the JSON messages over UDP")
+    ap.add_argument("--simulate", action="store_true",
+                    help="run on a synthetic scene -- no audio hardware")
     args = ap.parse_args()
-    log_mode = args.log or args.debug
+    log_mode = args.log or args.debug or args.json
 
-    audio_q: queue.Queue[np.ndarray] = queue.Queue()
+    sock = dest = None
+    if args.udp:
+        host, port = args.udp.rsplit(":", 1)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        dest = (host, int(port))
+
+    radar = Radar()
+    trail: deque = deque(maxlen=30)
+    buf = np.zeros(0, dtype=np.float32)
+    calibrated = False
+
+    if not args.json:
+        print(f"radar: {BAND[0] / 1000:.1f}-{BAND[1] / 1000:.1f} kHz chirps "
+              f"(L up-sweep, R down-sweep), {1 / PING_PERIOD:.0f} frames/s")
+        print("make sure system volume is up (~60-80%) -- "
+              "the chirps are inaudible")
+        print(f"calibrating for {CAL_PINGS * PING_PERIOD:.1f} s, "
+              "keep hands away from the laptop...")
+
+    def handle(window: np.ndarray) -> None:
+        nonlocal calibrated
+        r = radar.process(window)
+        stamp = time.strftime("%H:%M:%S")
+
+        if r["state"] == "ok" and not calibrated:
+            calibrated = True
+            if log_mode and not args.json:
+                off = mic_skew_cm(radar.ch_l.direct, radar.ch_r.direct)
+                print(f"calibration done (direct-path skew suggests mic at "
+                      f"x = {off:+.1f} cm; edit MIC_X if far off)")
+                print(f"  L: {radar.ch_l.health()}")
+                print(f"  R: {radar.ch_r.health()}\ntracking...\n")
+
+        if args.json or sock:
+            msg = {"t": round(time.time(), 3), "state": r["state"],
+                   "objects": [{"x": round(o["x"], 3), "z": round(o["z"], 3),
+                                "snr": round(o["snr"], 1)}
+                               for o in r.get("objects", [])]}
+            line = json.dumps(msg, separators=(",", ":"))
+            if args.json:
+                print(line, flush=True)
+            if sock:
+                sock.sendto(line.encode(), dest)
+            if args.json:
+                return
+
+        if log_mode:
+            if r["state"] == "silent":
+                print(f"{stamp} | mic is silent -- check mic "
+                      "permission / volume")
+            elif r["state"] == "ok":
+                objs = " | ".join(
+                    f"x{o['x'] * 100:+5.0f}cm z{o['z'] * 100:4.0f}cm "
+                    f"snr{o['snr']:5.1f}" for o in r["objects"])
+                line = f"{stamp} | {objs or 'no objects'}"
+                if args.debug:
+                    rl, rr = r["raw"]
+                    line += (f" || L med {rl.get('med', 0):.4f} "
+                             f"sd {rl.get('sigma', 0):.5f} "
+                             f"pk {len(rl.get('peaks', []))}"
+                             f" | R med {rr.get('med', 0):.4f} "
+                             f"sd {rr.get('sigma', 0):.5f} "
+                             f"pk {len(rr.get('peaks', []))}")
+                print(line, flush=True)
+            return
+
+        if r["state"] == "silent":
+            status, objects = "NO SIGNAL -- check mic permission and volume", []
+        elif r["state"] == "calibrating":
+            status, objects = "CALIBRATING -- keep hands away", []
+        else:
+            objects = r["objects"]
+            for o in objects:
+                trail.append((o["x"], o["z"]))
+            status = (f"tracking {len(objects)} object(s)"
+                      if objects else "scanning...")
+        sys.stdout.write(render(status, objects, trail))
+        sys.stdout.flush()
+
+    def consume(block: np.ndarray, xrun: bool) -> None:
+        nonlocal buf
+        if xrun:
+            radar.note_xrun()
+        buf = np.concatenate([buf, block])
+        if len(buf) > 8 * CFG.win_n:
+            cut = (len(buf) - 2 * CFG.win_n) // CFG.ping_n * CFG.ping_n
+            buf = buf[cut:]
+            print(f"[radar] behind by {cut / FS:.1f} s -- skipped ahead",
+                  file=sys.stderr)
+        while len(buf) >= CFG.win_n:
+            window = buf[:CFG.win_n].astype(np.float64)
+            buf = buf[CFG.ping_n:]
+            handle(window)
+
+    if args.simulate:
+        import simulate as sim
+        print("SIMULATION -- synthetic scene, no audio hardware in use")
+        scene = sim.RadarScene(
+            CFG, spk_x=(SPK_L_X, SPK_R_X), mic_x=MIC_X,
+            statics=[((0.0, 0.33), 0.04), ((-0.22, 0.62), 0.03)],
+            targets=[(lambda t: (0.22 * np.sin(2 * np.pi * 0.07 * t),
+                                 0.50 + 0.18 * np.sin(2 * np.pi * 0.045 * t)),
+                      0.025),
+                     (lambda t: (-0.10 + 0.002 * np.sin(2 * np.pi * 1.1 * t),
+                                 0.75 + 0.002 * np.sin(2 * np.pi * 0.9 * t)),
+                      0.02)],
+            noise=3e-4)
+        if not log_mode:
+            sys.stdout.write("\x1b[2J\x1b[?25l")
+        try:
+            for block, xrun in scene.blocks():
+                consume(block, xrun)
+        finally:
+            if not log_mode:
+                sys.stdout.write("\x1b[?25h\n")
+        return
+
+    import sounddevice as sd
+    audio_q: queue.Queue[tuple[np.ndarray, bool]] = queue.Queue()
     tx_pos = 0
 
     def callback(indata, outdata, frames, time_info, status):
         nonlocal tx_pos
         if status:
             print(f"[audio] {status}", file=sys.stderr)
-        idx = (tx_pos + np.arange(frames)) % PING_N
+        idx = (tx_pos + np.arange(frames)) % CFG.ping_n
         outdata[:] = TX[idx]
-        tx_pos = (tx_pos + frames) % PING_N
-        audio_q.put(indata[:, 0].copy())
-
-    print(f"radar: {BAND[0] / 1000:.1f}-{BAND[1] / 1000:.1f} kHz chirps "
-          f"(L up-sweep, R down-sweep), {1 / PING_PERIOD:.0f} frames/s")
-    print("make sure system volume is up (~60-80%) -- the chirps are inaudible")
-    print(f"calibrating for {CAL_PINGS * PING_PERIOD:.1f} s, "
-          "keep hands away from the laptop...")
-
-    radar = Radar()
-    trail: deque = deque(maxlen=30)
-    buf = np.zeros(0, dtype=np.float32)
-    calibrated = False
+        tx_pos = (tx_pos + frames) % CFG.ping_n
+        audio_q.put((indata[:, 0].copy(), bool(status)))
 
     if not log_mode:
         sys.stdout.write("\x1b[2J\x1b[?25l")     # clear screen, hide cursor
@@ -429,56 +423,7 @@ def main() -> None:
         with sd.Stream(samplerate=FS, channels=(1, 2), dtype="float32",
                        callback=callback):
             while True:
-                buf = np.concatenate([buf, audio_q.get()])
-                while len(buf) >= WIN_N:
-                    window = buf[:WIN_N].astype(np.float64)
-                    buf = buf[PING_N:]
-                    r = radar.process(window)
-                    stamp = time.strftime("%H:%M:%S")
-
-                    if r["state"] == "ok" and not calibrated:
-                        calibrated = True
-                        if log_mode:
-                            dl, dr = radar.ch_l.direct, radar.ch_r.direct
-                            off = (dl - dr) / FS * C / 2 * 100
-                            print(f"calibration done (direct-path skew "
-                                  f"suggests mic at x = {off:+.1f} cm; edit "
-                                  "MIC_X if far off). tracking...\n")
-
-                    if log_mode:
-                        if r["state"] == "silent":
-                            print(f"{stamp} | mic is silent -- check mic "
-                                  "permission / volume")
-                        elif r["state"] == "ok":
-                            objs = " | ".join(
-                                f"x{o['x'] * 100:+5.0f}cm z{o['z'] * 100:4.0f}cm "
-                                f"snr{o['snr']:5.1f}" for o in r["objects"])
-                            line = f"{stamp} | {objs or 'no objects'}"
-                            if args.debug:
-                                rl, rr = r["raw"]
-                                line += (f" || L med {rl['med']:.4f} "
-                                         f"sd {rl['sigma']:.5f} "
-                                         f"pk {len(rl['peaks'])}"
-                                         f" | R med {rr['med']:.4f} "
-                                         f"sd {rr['sigma']:.5f} "
-                                         f"pk {len(rr['peaks'])}")
-                            print(line, flush=True)
-                        continue
-
-                    if r["state"] == "silent":
-                        status = "NO SIGNAL -- check mic permission and volume"
-                        objects = []
-                    elif r["state"] == "calibrating":
-                        status = "CALIBRATING -- keep hands away"
-                        objects = []
-                    else:
-                        objects = r["objects"]
-                        for o in objects:
-                            trail.append((o["x"], o["z"]))
-                        status = (f"tracking {len(objects)} object(s)"
-                                  if objects else "scanning...")
-                    sys.stdout.write(render(status, objects, trail))
-                    sys.stdout.flush()
+                consume(*audio_q.get())
     finally:
         if not log_mode:
             sys.stdout.write("\x1b[?25h\n")      # restore cursor
