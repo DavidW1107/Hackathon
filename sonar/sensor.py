@@ -35,21 +35,22 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import numpy as np
 from sonar import FS, C, F0, F1, make_chirp, MIN_RANGE, MAX_RANGE
 
-FRAME_MS = 40
-PULSES_PER_WIN = 8            # ~0.32 s per detection frame
+FRAME_MS = 90                 # long gap so room reverb decays before the next chirp
+PULSES_PER_WIN = 3            # average 3 chirps/window (~0.27 s, ~3.7 Hz) for SNR
 DEVICE = 4                    # ALC285 analog, 2-ch
 MIC_BASELINE = 0.10           # m; assumed 2-mic spacing. ponytail: calibrate per laptop.
 PORT = 8765
 FOV = 50                      # forward cone half-angle (deg) we trust azimuth within
+MAX_RANGE = 4.0               # room size: range-gate + max mapped distance (overrides sonar)
 
-# detection thresholds (tune live) — ponytail: hand-tuned heuristics, swap for a
-# trained classifier if it misfires.
-CLUTTER_THRESH = 0.45         # fraction of peak = a static reflector
-MOTION_THRESH = 0.20          # motion margin ABOVE the noise-floor median (adaptive)
-FALL_SPEED = 2.0              # m/s and tight -> falling/thrown
-SPREAD_HUMAN = 0.30           # range-spread (m) or weak echo -> soft/human
-SENSOR_MIN = 0.5              # m; skip near-field crosstalk zone (false motion)
-MIN_VEL = 0.10                # m/s; reject targets not actually translating (phantoms)
+# detection (tune live via /config?motion= or --motion)
+CLUTTER_THRESH = 0.45         # fraction of background peak = a static reflector
+MOTION_THRESH = 0.08          # residual margin ABOVE the change-floor (adaptive MTI)
+FALL_SPEED = 2.0              # m/s + compact -> falling
+SPREAD_HUMAN = 0.30           # range-spread (m) or weak echo -> human/soft
+SENSOR_MIN = 0.5              # m; skip near-field crosstalk
+BG_ALPHA = 0.05               # background EMA rate (how fast the static scene is learned)
+WARMUP = 10                   # windows to learn the background before detecting
 
 # azimuth calibration (baseline in m + sign), overridden by calib.json if present
 CALIB_FILE = os.path.join(os.path.dirname(__file__), "calib.json")
@@ -61,6 +62,7 @@ if os.path.exists(CALIB_FILE):
         pass
 
 _cfg = {"motion": MOTION_THRESH}   # live-tunable via GET /config?motion=<val>
+_bg = {"prof": None, "warm": 0}    # MTI static-scene background + warmup counter
 _latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "clutter": [], "targets": []}
 _lock = threading.Lock()
 
@@ -114,60 +116,72 @@ def _az_at(rec2, flen, t0, minlag, bin_, P):
 
 
 def process_window(rec2, chirp, flen):
-    """rec2: (PULSES*flen, 2) float32. -> (clutter list, targets list)."""
+    """Average this window's chirps, subtract the learned static background (MTI).
+    -> (clutter from background, moving targets from residual, debug dict)."""
     minlag = int(2 * MIN_RANGE / C * FS)
     maxlag = int(2 * MAX_RANGE / C * FS)
     P = rec2.shape[0] // flen
     corrs = [np.abs(np.correlate(rec2[p * flen:(p + 1) * flen, 0], chirp, "valid"))
              for p in range(P)]
     L = min(len(c) for c in corrs)
-    # ONE common t0 for all pulses: speaker->mic latency is constant within a
-    # window, so per-pulse argmax jitter would misalign profiles and fake motion.
-    t0 = int(np.argmax(np.sum([c[:L] for c in corrs], 0)))
+    t0 = int(np.argmax(np.sum([c[:L] for c in corrs], 0)))    # common direct-path ref
     nb = min(maxlag, L - t0) - minlag
     if nb <= 0:
-        return [], [], {"peak": 0.0, "med": 0.0, "thr": 0.0, "raw": 0}
+        return [], [], {"peak": 0.0, "floor": 0.0, "thr": 0.0, "raw": 0, "warm": True}
     prof = np.vstack([c[t0 + minlag:t0 + minlag + nb] for c in corrs])
     rng = (minlag + np.arange(nb)) / FS * C / 2
-    mean_p = prof.mean(0)
-    norm = mean_p.max() + 1e-9
-    mean_n = mean_p / norm
-    motion_n = prof.std(0) / norm
-    gate = rng >= SENSOR_MIN                        # drop near-field crosstalk
-    mg = motion_n[gate]
-    med = float(np.median(mg)) if mg.size else 0.0
-    eff = _cfg["motion"] + med                      # adaptive: margin above noise floor
-    dbg = {"peak": round(float(mg.max()), 3) if mg.size else 0.0,
-           "med": round(med, 3), "thr": round(eff, 3), "raw": 0}
+    cur = prof.mean(0)                                        # average window -> SNR
 
+    B = _bg["prof"]
+    if B is None or len(B) != nb:                            # (re)initialise background
+        _bg["prof"] = cur.copy(); _bg["warm"] = 0
+        B = cur
+    else:                                                    # align cur to background:
+        x = np.correlate(cur - cur.mean(), B - B.mean(), "full")   # remove inter-window
+        shift = int(np.argmax(x)) - (nb - 1)                       # latency jitter
+        if 0 < abs(shift) <= 30:
+            cur = np.roll(cur, -shift)
+    warming = _bg["warm"] < WARMUP
+    resid = np.abs(cur - B)                                   # MTI: change from static
+    _bg["prof"] = (1 - BG_ALPHA) * B + BG_ALPHA * cur         # slowly follow the room
+    _bg["warm"] += 1
+
+    norm = B.max() + 1e-9
+    Bn, curn, residn = B / norm, cur / norm, resid / norm
+    gate = rng >= SENSOR_MIN
+
+    # static scene (background) -> clutter to render the room
     clutter = [{"range": round(float(rng[i]), 2),
                 "az": round(_az_at(rec2, flen, t0, minlag, i, P), 1),
-                "strength": round(float(mean_n[i]), 2)}
-               for i in _peaks(mean_n * gate, rng, CLUTTER_THRESH, min_sep=0.5, cap=6)]
+                "strength": round(float(Bn[i]), 2)}
+               for i in _peaks(Bn * gate, rng, CLUTTER_THRESH, min_sep=0.5, cap=6)]
+
+    rg = residn[gate]
+    floor = float(np.median(rg)) if rg.size else 0.0
+    eff = _cfg["motion"] + floor                             # adaptive on the change-floor
+    dbg = {"peak": round(float(rg.max()), 3) if rg.size else 0.0,
+           "floor": round(floor, 3), "thr": round(eff, 3), "raw": 0, "warm": warming}
+    if warming:
+        return clutter, [], dbg
 
     targets = []
-    clusters = _clusters((motion_n > eff) & gate)
+    clusters = _clusters((residn > eff) & gate)
     dbg["raw"] = len(clusters)
     for a, b in clusters:
         spread = float(rng[b] - rng[a])
-        if spread > 1.5:                            # spans half the room = misalign/noise
+        if spread > 1.5:
             continue
-        peak = a + int(np.argmax(motion_n[a:b + 1]))
-        strength = float(mean_n[peak])
-        pk_bins = prof[:, max(a - 1, 0):b + 2].argmax(1) + max(a - 1, 0)
-        rt = (minlag + pk_bins) / FS * C / 2
-        speed = float(np.clip(abs(rt[-1] - rt[0]) / (P * FRAME_MS / 1000), 0, 5))
-        if speed < MIN_VEL:                         # not translating -> phantom, skip
-            continue
+        peak = a + int(np.argmax(residn[a:b + 1]))
+        strength = float(curn[peak])
         az = _az_at(rec2, flen, t0, minlag, peak, P)
-        targets.append({"id": 0, "range": round(float(rng[peak]), 2),
-                        "az": round(az, 1), "vel": round(speed, 2),
-                        "strength": round(strength, 2), "spread": round(min(spread, 1.0), 2),
-                        "class": classify(strength, spread, speed), "_m": float(motion_n[peak])})
-    targets.sort(key=lambda t: -t["_m"])            # strongest movers first
+        targets.append({"id": 0, "range": round(float(rng[peak]), 2), "az": round(az, 1),
+                        "vel": 0.0, "strength": round(strength, 2),
+                        "spread": round(min(spread, 1.0), 2),
+                        "class": classify(strength, spread, 0.0), "_m": float(residn[peak])})
+    targets.sort(key=lambda t: -t["_m"])
     targets = targets[:3]
-    for i, t in enumerate(targets):
-        t["id"] = i; t.pop("_m")
+    for t in targets:
+        t.pop("_m")
     return clutter, targets, dbg
 
 
@@ -208,7 +222,8 @@ def live_loop():
     emit = np.tile(fr, PULSES_PER_WIN) * 0.8
     t_start = time.monotonic()
     prev = []
-    print(f"live sensing on device {DEVICE}  (thr={_cfg['motion']:.3f})")
+    dt = PULSES_PER_WIN * FRAME_MS / 1000
+    print(f"live sensing on device {DEVICE}  (range<={MAX_RANGE:.0f}m, margin={_cfg['motion']:.3f})")
     print(f"tune live:  curl 'http://localhost:{PORT}/config?motion=0.12'\n")
     while True:
         rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
@@ -216,14 +231,22 @@ def live_loop():
             clutter, targets, dbg = process_window(rec, chirp, flen)
         except Exception as e:
             print("process error:", e); continue
-        # 2-window persistence: real movers corroborate across frames within ~0.4 m.
-        matched = [t for t in targets if any(abs(t["range"] - r) < 0.4 for r in prev)]
-        prev = [t["range"] for t in targets]
-        for i, t in enumerate(matched):
+        # persistence + velocity: keep only targets matching one from the previous
+        # frame (within 0.6 m); velocity = its range change / frame time.
+        shown = []
+        for t in targets:
+            near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
+            if near and abs(near["range"] - t["range"]) < 0.6:
+                t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
+                if t["vel"] > FALL_SPEED and t["spread"] < 0.2:
+                    t["class"] = "falling"
+                shown.append(t)
+        for i, t in enumerate(shown):
             t["id"] = i
+        prev = targets
         ts = time.monotonic() - t_start
-        _publish(ts, clutter, matched)
-        _log(ts, dbg, matched)
+        _publish(ts, clutter, shown)
+        _log(ts, dbg, shown)
 
 
 def sim_loop():
@@ -254,11 +277,20 @@ def _publish(t, clutter, targets):
 
 
 def _log(ts, dbg, targets):
-    """One concise line per window for terminal debugging + sensitivity tuning."""
-    det = "  ".join(f"{t['class'][:4].upper()} r={t['range']:.2f} az={t['az']:+05.1f} "
-                    f"v={t['vel']:.2f} s={t['strength']:.2f}" for t in targets)
-    print(f"t={ts:6.1f}  peak={dbg['peak']:.3f} med={dbg['med']:.3f} thr={dbg['thr']:.3f}"
-          f"  raw={dbg['raw']} shown={len(targets)}  |  {det or 'quiet'}", flush=True)
+    """Readable per-window line; expands to one row per moving target."""
+    if dbg.get("warm"):
+        print(f"[{ts:6.1f}s]  learning background…", flush=True)
+        return
+    head = (f"[{ts:6.1f}s]  change floor={dbg['floor']:.3f}  peak={dbg['peak']:.3f}  "
+            f"thr={dbg['thr']:.3f}  moving={len(targets)}")
+    if not targets:
+        print(head + "   · still", flush=True)
+        return
+    print(head, flush=True)
+    for t in targets:
+        bar = "█" * min(int(t["strength"] * 20), 20)
+        print(f"      {t['class']:<7} {t['range']:4.2f}m  az {t['az']:+6.1f}°  "
+              f"{t['vel']:4.2f} m/s  refl {bar}", flush=True)
 
 
 def calibrate(angle_deg):
