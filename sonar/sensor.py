@@ -59,6 +59,7 @@ if os.path.exists(CALIB_FILE):
     except Exception:
         pass
 
+_cfg = {"motion": MOTION_THRESH}   # live-tunable via GET /config?motion=<val>
 _latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "clutter": [], "targets": []}
 _lock = threading.Lock()
 
@@ -139,7 +140,7 @@ def process_window(rec2, chirp, flen):
                for i in _peaks(mean_n * gate, rng, CLUTTER_THRESH, min_sep=0.5, cap=6)]
 
     targets = []
-    for a, b in _clusters((motion_n > MOTION_THRESH) & gate):
+    for a, b in _clusters((motion_n > _cfg["motion"]) & gate):
         spread = float(rng[b] - rng[a])
         if spread > 1.5:                            # spans half the room = misalign/noise
             continue
@@ -282,8 +283,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        with _lock:
-            body = json.dumps(_latest).encode()
+        if self.path.startswith("/config"):                 # live-tune detection knobs
+            from urllib.parse import urlparse, parse_qs
+            q = parse_qs(urlparse(self.path).query)
+            if "motion" in q:
+                try:
+                    _cfg["motion"] = max(0.02, min(1.0, float(q["motion"][0])))
+                except ValueError:
+                    pass
+            body = json.dumps(_cfg).encode()
+        else:
+            with _lock:
+                body = json.dumps(_latest).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Access-Control-Allow-Origin", "*")  # viewer on another origin

@@ -11,6 +11,10 @@ const params = new URLSearchParams(location.search);
 const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname);
 const sensorUrl = params.get("sensor") || (!params.has("demo") && isLocal ? "http://localhost:8765" : null);
 
+// live-tunable render + detection knobs, persisted across reloads
+const CFG = Object.assign({ bloom: 0.8, human: 1.0, arch: 1.0, smooth: 0.15, trail: 40, motion: 0.15 },
+  JSON.parse(localStorage.getItem("voidcfg") || "{}"));
+
 // ---------- scene ----------
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x04060a);
@@ -31,7 +35,8 @@ controls.update();
 
 const composer = new EffectComposer(renderer);
 composer.addPass(new RenderPass(scene, camera));
-composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.8, 0.5, 0.35));
+const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.8, 0.5, 0.35);
+composer.addPass(bloom);
 
 const grid = new THREE.GridHelper(16, 32, 0x1c3a2b, 0x0f1f18);
 grid.position.z = 4;
@@ -132,6 +137,7 @@ function buildClutter(f) {
     const m = c.strength > 0.7 ? makeWall() : c.strength > 0.45 ? makeDoor() : makeCouch();
     m.position.set(p.x, m.userData.y, p.z);
     m.lookAt(0, m.userData.y, 0);                      // face the sensor
+    m.traverse(o => { if (o.material) o.material.opacity *= CFG.arch; });
     clutterGroup.add(m);
   }
 }
@@ -198,6 +204,37 @@ addEventListener("resize", () => {
   renderer.setSize(innerWidth, innerHeight); composer.setSize(innerWidth, innerHeight);
 });
 
+// ---------- live tuning panel (native sliders, no dep) ----------
+const CTRLS = [
+  ["bloom", 0, 2, 0.05, "bloom glow"],
+  ["human", 0.5, 2, 0.05, "human size"],
+  ["arch", 0, 1, 0.05, "structure opacity"],
+  ["smooth", 0.03, 0.5, 0.01, "motion smoothing"],
+  ["trail", 0, 120, 5, "trail length"],
+  ["motion", 0.05, 0.4, 0.01, "sensitivity (live)"],
+];
+function applyCfg(k) {
+  if (k === "bloom") bloom.strength = CFG.bloom;
+  if (k === "motion" && sensorUrl) fetch(sensorUrl + "/config?motion=" + CFG.motion).catch(() => {});
+}
+(function panel() {
+  const el = document.createElement("div"); el.id = "panel";
+  el.innerHTML = "<b>TUNE</b>" + CTRLS.map(([k, mn, mx, st, lb]) =>
+    `<label>${lb}<span id="v_${k}">${CFG[k]}</span></label>` +
+    `<input id="c_${k}" type="range" min="${mn}" max="${mx}" step="${st}" value="${CFG[k]}">`).join("");
+  document.body.appendChild(el);
+  for (const [k] of CTRLS) {
+    document.getElementById("c_" + k).oninput = (e) => {
+      CFG[k] = parseFloat(e.target.value);
+      document.getElementById("v_" + k).textContent = CFG[k];
+      localStorage.setItem("voidcfg", JSON.stringify(CFG));
+      applyCfg(k);
+    };
+  }
+  bloom.strength = CFG.bloom;
+  applyCfg("motion");
+})();
+
 // ---------- render loop (60fps; smooths between ~10Hz detection frames) ----------
 function animate() {
   requestAnimationFrame(animate);
@@ -205,12 +242,13 @@ function animate() {
   if (frame && frame !== last) { buildClutter(frame); applyTargets(frame); updateHUD(frame); last = frame; }
   for (const t of tracked) {
     const dir = t.tgt.clone().sub(t.pos);
-    t.pos.lerp(t.tgt, 0.15); t.mesh.position.copy(t.pos);
+    t.pos.lerp(t.tgt, CFG.smooth); t.mesh.position.copy(t.pos);
     if (t.human) {
+      t.mesh.scale.setScalar(CFG.human);
       t.human.update(dt, t.vel);
       if (dir.length() > 0.03) t.mesh.rotation.y = Math.atan2(dir.x, dir.z);
       const p = t.pos.clone(); p.y = 0.05;
-      t.trailPts.push(p); if (t.trailPts.length > 40) t.trailPts.shift();
+      t.trailPts.push(p); while (t.trailPts.length > CFG.trail) t.trailPts.shift();
       t.trail.geometry.setFromPoints(t.trailPts);
     }
   }
