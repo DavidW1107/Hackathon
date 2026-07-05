@@ -33,6 +33,7 @@ import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
+import sonar
 from sonar import FS, C, F0, F1, make_chirp, MIN_RANGE, MAX_RANGE
 
 FRAME_MS = 90                 # long gap so room reverb decays before the next chirp
@@ -223,7 +224,8 @@ def live_loop():
     t_start = time.monotonic()
     prev = []
     dt = PULSES_PER_WIN * FRAME_MS / 1000
-    print(f"live sensing on device {DEVICE}  (range<={MAX_RANGE:.0f}m, margin={_cfg['motion']:.3f})")
+    print(f"live sensing on device {DEVICE}  (band={sonar.F0 // 1000}-{sonar.F1 // 1000}kHz, "
+          f"range<={MAX_RANGE:.0f}m, margin={_cfg['motion']:.3f})")
     print(f"tune live:  curl 'http://localhost:{PORT}/config?motion=0.12'\n")
     while True:
         rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
@@ -368,8 +370,12 @@ if __name__ == "__main__":
                     help="calibrate azimuth: reflector at this known angle (right +)")
     ap.add_argument("--motion", type=float, metavar="THR",
                     help="initial motion threshold (default from MOTION_THRESH); tune live via /config")
+    ap.add_argument("--band", choices=["high", "low"], default="high",
+                    help="high=17-21kHz near-inaudible; low=8-12kHz audible but far more coherent")
     a = ap.parse_args()
 
+    if a.band == "low":                    # longer wavelength -> far less phase-noise
+        sonar.F0, sonar.F1 = 8000, 12000
     if a.motion is not None:
         _cfg["motion"] = a.motion
 
