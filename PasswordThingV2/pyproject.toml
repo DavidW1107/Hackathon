@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keystroke-auth"
+version = "2.0.0"
+description = "Keystroke dynamics password system — verifies how you type, not just what."
+readme = "README.md"
+requires-python = ">=3.10"
+# The engine, simulator, tests and the `demo` command run with a dependency-free
+# base install. pynput is only needed for live `enroll` / `verify`:
+#   pip install -e '.[live]'
+dependencies = []
+
+[project.optional-dependencies]
+live = ["pynput>=1.7.7"]
+
+[project.scripts]
+kdp = "keystroke_auth.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["keystroke_auth*"]
