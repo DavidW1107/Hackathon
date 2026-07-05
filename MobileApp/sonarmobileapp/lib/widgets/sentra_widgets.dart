@@ -71,10 +71,27 @@ class StatusPill extends StatefulWidget {
 
 class _StatusPillState extends State<StatusPill>
     with SingleTickerProviderStateMixin {
-  late final AnimationController _c = AnimationController(
-    vsync: this,
-    duration: const Duration(milliseconds: 1600),
-  )..repeat(reverse: true);
+  late final AnimationController _c;
+
+  @override
+  void initState() {
+    super.initState();
+    _c = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1600),
+    );
+    if (widget.pulse) _c.repeat(reverse: true);
+  }
+
+  @override
+  void didUpdateWidget(StatusPill old) {
+    super.didUpdateWidget(old);
+    if (widget.pulse && !_c.isAnimating) {
+      _c.repeat(reverse: true);
+    } else if (!widget.pulse && _c.isAnimating) {
+      _c.stop();
+    }
+  }
 
   @override
   void dispose() {

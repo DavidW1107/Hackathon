@@ -1,104 +1,92 @@
 import 'package:flutter/material.dart';
+import '../services/sensor_service.dart';
 import '../theme/sentra_theme.dart';
 import '../widgets/sentra_widgets.dart';
 
-/// One entry in the activity feed, in plain English.
-class _Event {
-  const _Event({
-    required this.icon,
-    required this.color,
-    required this.title,
-    required this.detail,
-    required this.time,
-    this.isAlert = false,
-  });
-
-  final IconData icon;
-  final Color color;
-  final String title;
-  final String detail;
-  final String time;
-  final bool isAlert;
-}
-
+/// Live activity feed — real motion events streamed from the station.
 class EventsScreen extends StatelessWidget {
-  const EventsScreen({super.key});
+  const EventsScreen({super.key, required this.sensor});
 
-  static const _events = [
-    _Event(
-      icon: Icons.person_outline,
-      color: Sentra.greenBright,
-      title: 'You were recognized',
-      detail: 'Walking pattern matched — welcome home.',
-      time: '1:58 PM',
-    ),
-    _Event(
-      icon: Icons.check_circle_outline,
-      color: Sentra.green,
-      title: 'Back to normal',
-      detail: 'Movement stopped. Monitoring resumed.',
-      time: '1:58 PM',
-    ),
-    _Event(
-      icon: Icons.notifications_active_outlined,
-      color: Sentra.amber,
-      title: 'Alert sent to your phone',
-      detail: 'A snapshot was saved on this device.',
-      time: '1:58 PM',
-      isAlert: true,
-    ),
-    _Event(
-      icon: Icons.directions_walk,
-      color: Sentra.amber,
-      title: 'Movement detected',
-      detail: 'Something moved about 2.4 m from the sensor.',
-      time: '1:58 PM',
-      isAlert: true,
-    ),
-    _Event(
-      icon: Icons.radar,
-      color: Sentra.green,
-      title: 'Room scanned',
-      detail: 'Everything looked normal.',
-      time: '1:58 PM',
-    ),
-  ];
+  final SensorService sensor;
 
   @override
   Widget build(BuildContext context) {
-    return ListView(
-      padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
-      children: [
-        const Kicker('Activity'),
-        const SizedBox(height: 10),
-        Text('What happened today',
-            style: Sentra.display(size: 30, height: 1.05)),
-        const SizedBox(height: 22),
-        _statusBanner(),
-        const SizedBox(height: 26),
-        const Kicker('Today', color: Sentra.inkDim),
-        const SizedBox(height: 12),
-        for (final e in _events) ...[
-          _eventCard(e),
-          const SizedBox(height: 10),
-        ],
-        const SizedBox(height: 10),
-        Center(
-          child: Text(
-            'All activity stays on this device — nothing is uploaded.',
-            textAlign: TextAlign.center,
-            style: Sentra.sans(size: 12, color: Sentra.inkFaint),
-          ),
-        ),
-      ],
+    return ListenableBuilder(
+      listenable: sensor,
+      builder: (context, _) {
+        final events = sensor.events;
+        return ListView(
+          padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
+          children: [
+            const Kicker('Activity'),
+            const SizedBox(height: 10),
+            Text('What happened today',
+                style: Sentra.display(size: 30, height: 1.05)),
+            const SizedBox(height: 22),
+            _statusBanner(),
+            const SizedBox(height: 26),
+            const Kicker('Detections', color: Sentra.inkDim),
+            const SizedBox(height: 12),
+            if (events.isEmpty)
+              _emptyCard()
+            else
+              for (final e in events) ...[
+                _eventCard(e),
+                const SizedBox(height: 10),
+              ],
+            const SizedBox(height: 10),
+            Center(
+              child: Text(
+                'All activity stays on this device — nothing is uploaded.',
+                textAlign: TextAlign.center,
+                style: Sentra.sans(size: 12, color: Sentra.inkFaint),
+              ),
+            ),
+          ],
+        );
+      },
     );
   }
 
   Widget _statusBanner() {
+    final moving = sensor.targets.isNotEmpty;
+    final live = sensor.live;
+    final watching = live && sensor.armed;
+    final (color, icon, title, detail, pill) = !live
+        ? (
+            Sentra.inkDim,
+            Icons.sensors_off_outlined,
+            'Station offline',
+            'No signal from the sonar — start sensor.py.',
+            'Offline'
+          )
+        : !sensor.armed
+            ? (
+                Sentra.inkDim,
+                Icons.pause_circle_outline,
+                'Detection paused',
+                'The station is on standby — no detections or alerts until you arm it.',
+                'Paused'
+              )
+            : moving
+                ? (
+                    Sentra.amber,
+                    Icons.directions_walk,
+                    'Movement right now',
+                    'Something is moving about ${sensor.targets.first.range.toStringAsFixed(1)} m away.',
+                    'Motion'
+                  )
+                : (
+                    Sentra.green,
+                    Icons.shield_outlined,
+                    'All clear right now',
+                    'SENTRA is watching your space.',
+                    'Live'
+                  );
     return Panel(
       padding: const EdgeInsets.all(18),
-      borderColor: Sentra.lineGreenMid,
-      glow: true,
+      borderColor: watching ? Sentra.lineGreenMid : Sentra.lineWhite,
+      glow: watching,
       child: Row(
         children: [
           Container(
@@ -106,37 +94,63 @@ class EventsScreen extends StatelessWidget {
             height: 44,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: Sentra.green.withValues(alpha: 0.12),
+              color: color.withValues(alpha: 0.12),
             ),
-            child: const Icon(Icons.shield_outlined,
-                size: 22, color: Sentra.green),
+            child: Icon(icon, size: 22, color: color),
           ),
           const SizedBox(width: 14),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text('All clear right now',
+                Text(title,
                     style: Sentra.sans(
                         size: 15.5, weight: FontWeight.w600, color: Sentra.ink)),
                 const SizedBox(height: 3),
-                Text('SENTRA is watching your space.',
-                    style: Sentra.sans(size: 12.5)),
+                Text(detail, style: Sentra.sans(size: 12.5)),
               ],
             ),
           ),
-          const StatusPill(label: 'Live'),
+          StatusPill(label: pill, color: color, pulse: watching),
         ],
       ),
     );
   }
 
-  Widget _eventCard(_Event e) {
+  Widget _emptyCard() {
+    return Panel(
+      padding: const EdgeInsets.all(18),
+      borderColor: Sentra.lineWhite,
+      child: Row(
+        children: [
+          const Icon(Icons.nightlight_outlined,
+              size: 20, color: Sentra.inkFaint),
+          const SizedBox(width: 14),
+          Expanded(
+            child: Text(
+              'Nothing yet — motion events will appear here as the station detects them.',
+              style: Sentra.sans(size: 12.5, height: 1.4),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  static String _clock(DateTime t) {
+    final local = t.toLocal();
+    final h = local.hour % 12 == 0 ? 12 : local.hour % 12;
+    final m = local.minute.toString().padLeft(2, '0');
+    return '$h:$m ${local.hour < 12 ? 'AM' : 'PM'}';
+  }
+
+  Widget _eventCard(SensorEvent e) {
+    final where = e.range < 1.0
+        ? '${(e.range * 100).round()} cm'
+        : '${e.range.toStringAsFixed(1)} m';
     return Panel(
       padding: const EdgeInsets.all(14),
-      borderColor: e.isAlert
-          ? Sentra.amber.withValues(alpha: 0.35)
-          : Sentra.lineWhite,
+      borderColor: Sentra.amber.withValues(alpha: 0.35),
       child: Row(
         children: [
           Container(
@@ -144,25 +158,29 @@ class EventsScreen extends StatelessWidget {
             height: 38,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: e.color.withValues(alpha: 0.12),
+              color: Sentra.amber.withValues(alpha: 0.12),
             ),
-            child: Icon(e.icon, size: 19, color: e.color),
+            child: const Icon(Icons.directions_walk,
+                size: 19, color: Sentra.amber),
           ),
           const SizedBox(width: 12),
           Expanded(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(e.title,
+                Text('Movement detected',
                     style: Sentra.sans(
                         size: 14, weight: FontWeight.w600, color: Sentra.ink)),
                 const SizedBox(height: 3),
-                Text(e.detail, style: Sentra.sans(size: 12.5, height: 1.4)),
+                Text(
+                  'Something moved about $where from the station.',
+                  style: Sentra.sans(size: 12.5, height: 1.4),
+                ),
               ],
             ),
           ),
           const SizedBox(width: 10),
-          Text(e.time,
+          Text(_clock(e.wall),
               style: Sentra.mono(size: 10, color: Sentra.inkFaint)),
         ],
       ),

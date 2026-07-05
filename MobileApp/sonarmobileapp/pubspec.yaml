@@ -42,6 +42,9 @@ dependencies:
   # polls the Python sonar sensor's JSON feed (http://<host>:8765/)
   http: ^1.2.2
 
+  # local notifications fired when the station reports a motion event
+  flutter_local_notifications: ^18.0.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -36,26 +36,46 @@ FRAME_MS = 90                 # long gap so room reverb decays before the next c
 PULSES_PER_WIN = 3            # average 3 chirps/window (~0.27 s, ~3.7 Hz) for SNR
 DEVICE = 4 if sys.platform.startswith("linux") else None  # ALC285 analog (2-ch) on Linux; None = system default elsewhere
 MIC_BASELINE = 0.10           # m; assumed 2-mic spacing. ponytail: calibrate per laptop.
+AZ_SIGN = 1.0                 # flips left/right if the mics are swapped
+
+# per-laptop azimuth calibration written by --calibrate (overrides the guesses
+# above — without it all azimuths are scaled by an arbitrary baseline)
+try:
+    with open(os.path.join(os.path.dirname(__file__), "calib.json")) as _f:
+        _cal = json.load(_f)
+    MIC_BASELINE = float(_cal["baseline"])
+    AZ_SIGN = float(_cal.get("sign", 1.0))
+    print(f"azimuth calib loaded: baseline={MIC_BASELINE * 100:.1f} cm, sign={AZ_SIGN:+.0f}")
+except (OSError, ValueError, KeyError):
+    pass
 PORT = 8765
-FOV = 50                      # forward cone half-angle (deg) we trust azimuth within
+FOV = 80                      # forward cone half-angle (deg) we trust azimuth within FOV = 50         
 NEAR = 0.10                   # closest detectable range (m) — coherent ref handles near field
 MAX_RANGE = 2.0               # farthest mapped range (m); overrides sonar default
 
 CLUTTER_THRESH = 0.45         # fraction of background peak = a static reflector
 SNR_THRESH = 5.0              # detect when residual peak > median + SNR_THRESH*sigma
 ABS_FLOOR = 0.002             # min residual (echo/direct ratio) to count
-WARMUP = 20                   # windows to learn the static background + noise floor
+WARMUP = 40                   # windows to learn the static background + noise floor WARMUP = 20
 BG_ADAPT = 0.02               # slow background drift far from activity
 BG_FAST = 0.30                # fast absorption of confirmed phase-frozen (stale) residue
 EMA_A = 0.15                  # temporal-coherence smoothing per window
 COH_STALE = 0.95              # residue coherence above this = static change, not a live target
 STALE_RUN = 30                # windows coherence must stay high before absorbing (~2.7 s)
 
-_cfg = {"snr": SNR_THRESH, "abs": None}   # abs = absolute residual threshold; overrides snr
+EVENT_GAP_S = 2.5             # quiet time that ends a motion episode (-> next hit = new event)
+EVENT_KEEP = 100              # ring buffer size for /events
+
+_cfg = {"snr": SNR_THRESH, "abs": None,    # abs = absolute residual threshold; overrides snr
+        "max_range": MAX_RANGE,            # live range gate; /config?max_range= re-warms the bg
+        "fov": float(FOV),                 # trusted azimuth cone half-angle (deg)
+        "armed": True}                     # /config?armed=0 mutes the chirp + pauses detection
 _bg = {"prof": None, "warm": 0}    # complex static background + warmup counter
 _mf = {"conj": None, "cn": 0, "nfft": 0}   # complex matched-filter kernel (set per band)
 _view = {"map": False}
-_latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "clutter": [], "targets": []}
+_latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "armed": True,
+           "clutter": [], "targets": []}
+_ev = {"seq": 0, "events": [], "active": False, "last_t": 0.0}   # motion episodes for /events
 _lock = threading.Lock()
 
 
@@ -124,8 +144,8 @@ def _az_at(rec2, flen, t0, minlag, bin_, P):
         lags.append(_parabolic(xc, int(np.argmax(xc))) - (len(b) - 1))
     if not lags:
         return 0.0
-    sin_th = np.clip(np.median(lags) / FS * C / MIC_BASELINE, -1, 1)
-    return float(np.clip(math.degrees(math.asin(sin_th)), -FOV, FOV))
+    sin_th = np.clip(AZ_SIGN * np.median(lags) / FS * C / MIC_BASELINE, -1, 1)
+    return float(np.clip(math.degrees(math.asin(sin_th)), -_cfg["fov"], _cfg["fov"]))
 
 
 # ARCHIVED 2026-07-05: human/hard/falling split disabled until motion detection is
@@ -156,7 +176,7 @@ def _dbg(noise=0.0, peak=0.0, thr=0.0, raw=0, warm=False):
 def process_window(rec2, flen):
     """Coherent MTI. -> (clutter, moving targets, debug). Uses module _mf + _bg."""
     minlag = int(2 * NEAR / C * FS)
-    maxlag = int(2 * MAX_RANGE / C * FS)
+    maxlag = int(2 * _cfg["max_range"] / C * FS)
     P = rec2.shape[0] // flen
     segs, ds = [], []
     for p in range(P):
@@ -260,6 +280,10 @@ def live_loop():
     st = {"tx": 0}
 
     def cb(indata, outdata, frames, tinfo, status):
+        if not _cfg["armed"]:                               # disarmed: silence, drop input
+            outdata[:] = 0
+            st["tx"] = 0
+            return
         idx = (st["tx"] + np.arange(frames)) % flen        # loop the chirp forever
         outdata[:] = tx[idx][:, None]
         st["tx"] = (st["tx"] + frames) % flen
@@ -271,13 +295,37 @@ def live_loop():
     t_start = time.monotonic()
     mode = f"abs>{_cfg['abs']}" if _cfg["abs"] is not None else f"snr>{_cfg['snr']:.0f}"
     print(f"live sensing on device {DEVICE}  (band={sonar.F0 // 1000}-{sonar.F1 // 1000}kHz, "
-          f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, {mode})")
-    print(f"tune live:  curl 'http://localhost:{PORT}/config?thresh=0.6'   (or ?snr=5, ?thresh=auto)\n")
+          f"range {NEAR:.2f}-{_cfg['max_range']:.1f}m, {mode})")
+    print(f"tune live:  curl 'http://localhost:{PORT}/config?thresh=0.6'   "
+          f"(or ?snr=5, ?thresh=auto, ?max_range=2.5)\n")
     buf = np.zeros((0, 2), dtype=np.float32)
     in_ch = min(2, sd.query_devices(DEVICE, "input")["max_input_channels"])
+    if in_ch < 2:
+        print("WARNING: input device is MONO — azimuth needs 2 mics, so every "
+              "target will report az=0 (dead centre on the radar). Plug in a "
+              "stereo input and run --calibrate to get direction.")
+    was_armed = True
     with sd.Stream(samplerate=FS, channels=(in_ch, 2), dtype="float32", device=DEVICE, callback=cb):
         while True:
-            buf = np.concatenate([buf, q.get()])
+            if not _cfg["armed"]:                           # standby: keep publishing so
+                if was_armed:                               # clients see we're alive
+                    was_armed = False
+                    prev = []
+                    buf = np.zeros((0, 2), dtype=np.float32)
+                    print("disarmed — chirp muted, standby", flush=True)
+                while not q.empty():
+                    q.get_nowait()
+                _publish(time.monotonic() - t_start, [], [])
+                time.sleep(0.2)
+                continue
+            if not was_armed:
+                was_armed = True
+                _bg["prof"] = None                          # scene may have changed: re-learn
+                print("armed — re-learning background", flush=True)
+            try:
+                buf = np.concatenate([buf, q.get(timeout=1.0)])
+            except queue.Empty:
+                continue
             while len(buf) >= win:
                 window = buf[:win]
                 buf = buf[flen:]                            # advance exactly one ping
@@ -304,7 +352,11 @@ def sim_loop():
     t_start = time.monotonic()
     while True:
         t = time.monotonic() - t_start
-        az = FOV * math.sin(t * 0.6)
+        if not _cfg["armed"]:
+            _publish(t, [], [])
+            time.sleep(FRAME_MS * PULSES_PER_WIN / 1000)
+            continue
+        az = _cfg["fov"] * math.sin(t * 0.6)
         rng = 1.4 + 0.4 * math.sin(t * 0.9)
         targets = [{"id": 0, "range": round(rng, 2), "az": round(az, 1),
                     "vel": round(0.6 + 0.3 * abs(math.cos(t * 0.6)), 2),
@@ -315,8 +367,23 @@ def sim_loop():
 
 
 def _publish(t, clutter, targets):
+    """Update the latest frame + track motion episodes. Targets appearing after
+    EVENT_GAP_S of quiet start a new event (one per episode, for phone alerts)."""
     with _lock:
         _latest.update(t=round(t, 2), clutter=clutter, targets=targets)
+        if targets:
+            if not _ev["active"]:
+                _ev["active"] = True
+                _ev["seq"] += 1
+                s = targets[0]                       # strongest mover
+                _ev["events"].append({"id": _ev["seq"], "t": round(t, 2),
+                                      "wall": round(time.time(), 2),
+                                      "range": s["range"], "az": s["az"],
+                                      "snr": s.get("snr", 0)})
+                del _ev["events"][:-EVENT_KEEP]
+            _ev["last_t"] = t
+        elif _ev["active"] and t - _ev["last_t"] > EVENT_GAP_S:
+            _ev["active"] = False
 
 
 def _log(ts, dbg, clutter, targets):
@@ -342,8 +409,8 @@ def _draw_map(ts, dbg, clutter, targets):
 
     def put(r, az, ch):
         a = math.radians(az)
-        col = cx + int(round(r * math.sin(a) / MAX_RANGE * cx))
-        row = cy - int(round(r * math.cos(a) / MAX_RANGE * (H - 1)))
+        col = cx + int(round(r * math.sin(a) / _cfg["max_range"] * cx))
+        row = cy - int(round(r * math.cos(a) / _cfg["max_range"] * (H - 1)))
         if 0 <= row < H and 0 <= col < W:
             grid[row][col] = ch
 
@@ -360,7 +427,7 @@ def _draw_map(ts, dbg, clutter, targets):
              " legend: M=motion  ·=static  ^=sensor",
              " +" + "-" * W + "+"]
     lines += [" |" + "".join(r) + "|" for r in grid]
-    lines.append(" +" + "-" * W + f"+  depth {NEAR:.1f}..{MAX_RANGE:.0f}m up, width +/-{FOV}deg")
+    lines.append(" +" + "-" * W + f"+  depth {NEAR:.1f}..{_cfg['max_range']:.1f}m up, width +/-{_cfg['fov']:.0f}deg")
     for t in targets:
         lines.append(f"   motion {t['range']:.2f}m  az {t['az']:+.0f}deg  {t['vel']:.2f}m/s  snr {t.get('snr',0):.1f}")
     print("\n".join(lines), flush=True)
@@ -453,7 +520,32 @@ class Handler(BaseHTTPRequestHandler):
                     _cfg["abs"] = None if v in ("", "auto", "off") else float(v)
                 except ValueError:
                     pass
+            if "max_range" in q:                         # live range gate; bg re-warms itself
+                try:
+                    v = max(0.3, min(6.0, float(q["max_range"][0])))
+                    _cfg["max_range"] = v
+                    with _lock:
+                        _latest["max_range"] = v
+                except ValueError:
+                    pass
+            if "fov" in q:                               # trusted azimuth cone (deg)
+                try:
+                    v = max(10.0, min(80.0, float(q["fov"][0])))
+                    _cfg["fov"] = v
+                    with _lock:
+                        _latest["fov"] = v
+                except ValueError:
+                    pass
+            if "armed" in q:                             # 0 = mute chirp + standby
+                v = q["armed"][0].lower() in ("1", "true", "on", "yes")
+                _cfg["armed"] = v
+                with _lock:
+                    _latest["armed"] = v
             body = json.dumps(_cfg).encode()
+        elif self.path.startswith("/events"):
+            with _lock:
+                body = json.dumps({"latest_id": _ev["seq"],
+                                   "events": list(_ev["events"])}).encode()
         else:
             with _lock:
                 body = json.dumps(_latest).encode()

@@ -28,6 +28,15 @@ python sensor.py                          # live sensing (device 4 = analog mic/
 python sensor.py --sim --record web/sample.json --seconds 15   # regenerate demo data
 ```
 
+HTTP API (port 8765, CORS open — the web viewer and the Flutter app both use it):
+
+| Endpoint | Does |
+|---|---|
+| `/` | latest detection frame (`targets`, `clutter`, `fov`, `max_range`) |
+| `/events` | last 100 motion episodes (`{id, t, wall, range, az, snr}`) — the app polls this and fires a phone notification per new event |
+| `/config?max_range=2.5` | set the detection distance live (0.3–6 m; background re-learns for ~2 s) |
+| `/config?snr=5` / `?thresh=0.6` | detection threshold tuning |
+
 Viewer (local): serve `web/` and open it —
 
 ```bash

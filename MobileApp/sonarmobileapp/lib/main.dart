@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'theme/sentra_theme.dart';
@@ -5,9 +6,12 @@ import 'widgets/sentra_widgets.dart';
 import 'screens/radar_screen.dart';
 import 'screens/events_screen.dart';
 import 'screens/station_screen.dart';
+import 'services/alerts.dart';
+import 'services/sensor_service.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  Alerts.init();
   SystemChrome.setSystemUIOverlayStyle(const SystemUiOverlayStyle(
     statusBarColor: Colors.transparent,
     statusBarIconBrightness: Brightness.light,
@@ -40,27 +44,70 @@ class AppShell extends StatefulWidget {
 
 class _AppShellState extends State<AppShell> {
   int _index = 0;
-  bool _armed = true;
+  final SensorService _sensor = SensorService();
+
+  SensorEvent? _banner;
+  Timer? _bannerTimer;
+
+  @override
+  void initState() {
+    super.initState();
+    _sensor.onMotionEvent = _showBanner;
+    _sensor.start();
+  }
+
+  @override
+  void dispose() {
+    _bannerTimer?.cancel();
+    _sensor.onMotionEvent = null;
+    _sensor.dispose();
+    super.dispose();
+  }
+
+  void _showBanner(SensorEvent e) {
+    if (!mounted) return;
+    setState(() => _banner = e);
+    _bannerTimer?.cancel();
+    _bannerTimer = Timer(const Duration(seconds: 5), () {
+      if (mounted) setState(() => _banner = null);
+    });
+  }
+
+  void _dismissBanner({bool toEvents = false}) {
+    _bannerTimer?.cancel();
+    setState(() {
+      _banner = null;
+      if (toEvents) _index = 1;
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     final screens = [
-      RadarScreen(armed: _armed),
-      const EventsScreen(),
-      StationScreen(
-        armed: _armed,
-        onArmedChanged: (v) => setState(() => _armed = v),
-      ),
+      RadarScreen(sensor: _sensor),
+      EventsScreen(sensor: _sensor),
+      StationScreen(sensor: _sensor),
     ];
 
     return Scaffold(
       body: SafeArea(
         bottom: false,
-        child: Column(
+        child: Stack(
           children: [
-            _TopBar(armed: _armed),
-            Expanded(
-              child: IndexedStack(index: _index, children: screens),
+            Column(
+              children: [
+                ListenableBuilder(
+                  listenable: _sensor,
+                  builder: (context, _) => _TopBar(armed: _sensor.armed),
+                ),
+                Expanded(
+                  child: IndexedStack(index: _index, children: screens),
+                ),
+              ],
+            ),
+            _MotionBanner(
+              event: _banner,
+              onTap: () => _dismissBanner(toEvents: true),
             ),
           ],
         ),
@@ -71,6 +118,112 @@ class _AppShellState extends State<AppShell> {
       ),
     );
   }
+}
+
+/// In-app alert that slides down from the top when the station reports a
+/// fresh motion event. Tap to jump to the activity feed.
+class _MotionBanner extends StatefulWidget {
+  const _MotionBanner({required this.event, required this.onTap});
+
+  final SensorEvent? event;
+  final VoidCallback onTap;
+
+  @override
+  State<_MotionBanner> createState() => _MotionBannerState();
+}
+
+class _MotionBannerState extends State<_MotionBanner> {
+  // Retained so the card keeps its content while sliding back out.
+  SensorEvent? _last;
+
+  @override
+  Widget build(BuildContext context) {
+    final visible = widget.event != null;
+    if (widget.event != null) _last = widget.event;
+    final e = _last;
+    return Positioned(
+      top: 10,
+      left: 16,
+      right: 16,
+      child: IgnorePointer(
+        ignoring: !visible,
+        child: AnimatedSlide(
+          offset: visible ? Offset.zero : const Offset(0, -1.8),
+          duration: const Duration(milliseconds: 320),
+          curve: Curves.easeOutCubic,
+          child: AnimatedOpacity(
+            opacity: visible ? 1 : 0,
+            duration: const Duration(milliseconds: 240),
+            child: e == null
+                ? const SizedBox.shrink()
+                : GestureDetector(
+                    onTap: widget.onTap,
+                    child: Container(
+                      padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
+                      decoration: BoxDecoration(
+                        color: Sentra.bgPanel,
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                            color: Sentra.amber.withValues(alpha: 0.5)),
+                        boxShadow: [
+                          BoxShadow(
+                            color: Colors.black.withValues(alpha: 0.55),
+                            blurRadius: 18,
+                            offset: const Offset(0, 6),
+                          ),
+                          BoxShadow(
+                            color: Sentra.amber.withValues(alpha: 0.18),
+                            blurRadius: 22,
+                          ),
+                        ],
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 36,
+                            height: 36,
+                            decoration: BoxDecoration(
+                              shape: BoxShape.circle,
+                              color: Sentra.amber.withValues(alpha: 0.14),
+                            ),
+                            child: const Icon(Icons.directions_walk,
+                                size: 18, color: Sentra.amber),
+                          ),
+                          const SizedBox(width: 12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text('Movement detected',
+                                    style: Sentra.sans(
+                                        size: 13.5,
+                                        weight: FontWeight.w600,
+                                        color: Sentra.ink)),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'About ${_where(e.range)} away · tap to view',
+                                  style: Sentra.sans(size: 11.5),
+                                ),
+                              ],
+                            ),
+                          ),
+                          const SizedBox(width: 8),
+                          Text('now',
+                              style: Sentra.mono(
+                                  size: 9.5, color: Sentra.inkFaint)),
+                        ],
+                      ),
+                    ),
+                  ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  static String _where(double range) => range < 1.0
+      ? '${(range * 100).round()} cm'
+      : '${range.toStringAsFixed(1)} m';
 }
 
 class _TopBar extends StatelessWidget {

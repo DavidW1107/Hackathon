@@ -1,16 +1,12 @@
 import 'package:flutter/material.dart';
+import '../services/sensor_service.dart';
 import '../theme/sentra_theme.dart';
 import '../widgets/sentra_widgets.dart';
 
 class StationScreen extends StatefulWidget {
-  const StationScreen({
-    super.key,
-    required this.armed,
-    required this.onArmedChanged,
-  });
+  const StationScreen({super.key, required this.sensor});
 
-  final bool armed;
-  final ValueChanged<bool> onArmedChanged;
+  final SensorService sensor;
 
   @override
   State<StationScreen> createState() => _StationScreenState();
@@ -18,13 +14,17 @@ class StationScreen extends StatefulWidget {
 
 class _StationScreenState extends State<StationScreen> {
   bool _petSafe = true;
-  bool _rangeGate = true;
-  bool _pushAlerts = true;
-  bool _snapshot = false;
 
   @override
   Widget build(BuildContext context) {
-    final armed = widget.armed;
+    return ListenableBuilder(
+      listenable: widget.sensor,
+      builder: (context, _) => _body(context, widget.sensor),
+    );
+  }
+
+  Widget _body(BuildContext context, SensorService sensor) {
+    final armed = sensor.armed;
     return ListView(
       padding: const EdgeInsets.fromLTRB(20, 8, 20, 28),
       children: [
@@ -62,17 +62,23 @@ class _StationScreenState extends State<StationScreen> {
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text('MacBook Pro · Room A4',
+                        Text(sensor.deviceName,
                             style: Sentra.sans(
                                 size: 14.5,
                                 weight: FontWeight.w600,
                                 color: Sentra.ink)),
                         const SizedBox(height: 3),
-                        Text('sonr-station-a4 · 192.168.4.21',
+                        Text('sonr-station-a4 · ${sensor.host}',
                             style: Sentra.mono(
                                 size: 10.5, color: Sentra.inkFaint)),
                       ],
                     ),
+                  ),
+                  IconButton(
+                    icon: const Icon(Icons.edit_outlined,
+                        size: 16, color: Sentra.inkDim),
+                    tooltip: 'Edit station name & address',
+                    onPressed: () => _editStation(context, sensor),
                   ),
                 ],
               ),
@@ -98,7 +104,7 @@ class _StationScreenState extends State<StationScreen> {
                     const Spacer(),
                     Switch.adaptive(
                       value: armed,
-                      onChanged: widget.onArmedChanged,
+                      onChanged: sensor.setArmed,
                       activeColor: Sentra.onGreen,
                       activeTrackColor: Sentra.green,
                       inactiveThumbColor: Sentra.inkDim,
@@ -129,27 +135,11 @@ class _StationScreenState extends State<StationScreen> {
               ),
               _rowDivider(),
               _toggleRow(
-                icon: Icons.crop_free,
-                title: 'Range-gate to room',
-                subtitle: 'Discard echoes beyond 3.1m',
-                value: _rangeGate,
-                onChanged: (v) => setState(() => _rangeGate = v),
-              ),
-              _rowDivider(),
-              _toggleRow(
                 icon: Icons.notifications_active_outlined,
                 title: 'Push alerts',
                 subtitle: 'Notify this phone on detection',
-                value: _pushAlerts,
-                onChanged: (v) => setState(() => _pushAlerts = v),
-              ),
-              _rowDivider(),
-              _toggleRow(
-                icon: Icons.photo_camera_outlined,
-                title: 'Webcam snapshot',
-                subtitle: 'Capture a frame with each alert',
-                value: _snapshot,
-                onChanged: (v) => setState(() => _snapshot = v),
+                value: sensor.pushAlerts,
+                onChanged: sensor.setPushAlerts,
               ),
             ],
           ),
@@ -161,6 +151,66 @@ class _StationScreenState extends State<StationScreen> {
         ),
       ],
     );
+  }
+
+  Future<void> _editStation(BuildContext context, SensorService sensor) async {
+    final nameCtrl = TextEditingController(text: sensor.deviceName);
+    final hostCtrl = TextEditingController(text: sensor.host);
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: Sentra.bgPanel,
+        title: Text('Edit station',
+            style: Sentra.sans(
+                size: 16, weight: FontWeight.w600, color: Sentra.ink)),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: nameCtrl,
+              autofocus: true,
+              textCapitalization: TextCapitalization.words,
+              style: Sentra.sans(size: 14, color: Sentra.ink),
+              decoration: InputDecoration(
+                labelText: 'Name',
+                labelStyle: Sentra.sans(size: 12, color: Sentra.inkFaint),
+                hintText: 'MacBook Pro · Room A4',
+                hintStyle: Sentra.sans(size: 14, color: Sentra.inkFaint),
+              ),
+            ),
+            const SizedBox(height: 14),
+            TextField(
+              controller: hostCtrl,
+              keyboardType: TextInputType.url,
+              style: Sentra.mono(size: 13, color: Sentra.ink),
+              decoration: InputDecoration(
+                labelText: 'Address',
+                labelStyle: Sentra.sans(size: 12, color: Sentra.inkFaint),
+                hintText: '192.168.1.42:8765',
+                hintStyle: Sentra.mono(size: 13, color: Sentra.inkFaint),
+                helperText:
+                    'host:port of sensor.py — localhost on this machine, '
+                    'the laptop\'s LAN IP from a phone',
+                helperStyle: Sentra.sans(size: 11, color: Sentra.inkFaint),
+              ),
+              onSubmitted: (_) => Navigator.pop(ctx, true),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Cancel')),
+          TextButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Save')),
+        ],
+      ),
+    );
+    if (saved == true) {
+      sensor.setDeviceName(nameCtrl.text);
+      sensor.setHost(hostCtrl.text);
+    }
   }
 
   Widget _rowDivider() =>
