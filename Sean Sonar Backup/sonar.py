@@ -2,13 +2,11 @@
 """
 sonar.py -- near-ultrasonic sonar using the laptop's speakers and mic.
 
-Continuously emits short 17-21 kHz chirps (near-inaudible),
+Continuously emits short 18-20 kHz chirps (inaudible to most adults),
 records with the built-in mic, and matched-filters the recording.
 The mic hears each chirp twice: once via the direct speaker->mic path,
-and again after reflecting off your hand. Coarse distance comes from the
-delay between those two arrivals, so audio I/O latency cancels out. On
-top of that, the echo's carrier phase is tracked ping to ping: it turns
-2*pi per ~9 mm of range change, resolving sub-millimetre motion.
+and again after reflecting off your hand. Distance is computed from the
+delay between those two arrivals, so audio I/O latency cancels out.
 
 A ~2 s calibration at startup learns the static echoes (screen, desk,
 walls) as a complex correlation profile; each ping is coherently
@@ -32,37 +30,24 @@ import sounddevice as sd
 
 # ---------------------------- configuration ---------------------------------
 FS          = 48_000          # sample rate (Hz)
-F0, F1      = 17_000, 21_000  # chirp band (Hz) -- near-inaudible; 4 kHz of
-                              # bandwidth -> c/2B ~ 4.3 cm range resolution
+F0, F1      = 18_000, 20_000  # chirp band (Hz) -- above most adults' hearing
 CHIRP_DUR   = 0.006           # chirp length (s)
-PING_PERIOD = 0.050           # one ping every 50 ms -> 20 readings/s
+PING_PERIOD = 0.100           # one ping every 100 ms -> 10 readings/s
 VOLUME      = 0.6             # output amplitude (0..1)
 C           = 343.0           # speed of sound (m/s)
 MIN_D       = 0.07            # closest detectable hand (m)
 MAX_D       = 1.00            # farthest detectable hand (m)
-CAL_PINGS   = 40              # pings used to learn the static background (~2 s)
+CAL_PINGS   = 20              # pings used to learn the static background
 SNR_THRESH  = 6.0             # detection threshold (x noise sigma)
 ABS_FLOOR   = 0.002           # min echo strength relative to direct path
-# per-ping rates below are tied to PING_PERIOD: halved along with it so the
-# wall-clock behaviour at 20 pings/s matches the old 10 pings/s tuning
-BG_ADAPT    = 0.01            # slow background adaptation rate
-BG_FAST     = 0.30            # absorption rate of confirmed-stale residue
-REF_ADAPT   = 0.025           # direct-path reference tracking rate
-EMA_A       = 0.10            # temporal-coherence smoothing per ping
+BG_ADAPT    = 0.02            # slow background adaptation rate
+BG_FAST     = 0.10            # fast absorption of stale (phase-frozen) residue
+REF_ADAPT   = 0.05            # direct-path reference tracking rate
+EMA_A       = 0.20            # temporal-coherence smoothing per ping
 COH_STALE   = 0.95            # residue coherence above this = static scene
                               # change, not a live target (living things
                               # wobble in echo phase; even breathing is
                               # >1 rad at these frequencies)
-STALE_RUN   = 40              # frames coherence must stay high before
-                              # absorbing -- longer than the still moment
-                              # at the extremes of a breath (~2 s)
-FC          = (F0 + F1) / 2   # carrier (Hz) for phase-based fine ranging
-FINE_PULL   = 0.05            # per-ping pull of the fine track toward the
-                              # coarse range -- kills phase-integration drift
-FINE_SNAP   = 0.03            # fine/coarse divergence (m) that re-anchors
-FINE_JUMP   = 2               # peak moved > this many bins in one ping ->
-                              # phase delta would alias; coast on coarse
-VEL_A       = 0.2             # fine-velocity readout smoothing
 # -----------------------------------------------------------------------------
 
 PING_N  = int(FS * PING_PERIOD)
@@ -120,12 +105,7 @@ class Sonar:
         self.sigma = 1e-9
         self.ema_c: np.ndarray | None = None  # complex residual average
         self.ema_m: np.ndarray | None = None  # residual magnitude average
-        self.stale_run: np.ndarray | None = None  # consecutive high-coh frames
-        self.recent: deque[float] = deque(maxlen=5)
-        self.fine: float | None = None        # phase-integrated distance (m)
-        self.vel = 0.0                        # smoothed fine velocity (m/s)
-        self.prev_z: complex | None = None    # derotated peak residual
-        self.prev_i: int | None = None
+        self.recent: deque[float] = deque(maxlen=3)
 
     def process(self, window: np.ndarray) -> dict:
         """Returns {'state': 'silent'|'calibrating'|'no_echo'|'echo', ...}."""
@@ -146,8 +126,6 @@ class Sonar:
             self.cal_ref.clear()
             self.bg = None
             self.recent.clear()
-            self.fine = None
-            self.prev_z = None
             if relocked:
                 return {"state": "relock"}
 
@@ -170,7 +148,6 @@ class Sonar:
                     1.4826 * np.median(np.abs(pool - self.med))) + 1e-9
                 self.ema_c = np.zeros(len(self.bg), dtype=complex)
                 self.ema_m = np.zeros(len(self.bg))
-                self.stale_run = np.zeros(len(self.bg))
                 self.cal.clear()
                 self.cal_ref.clear()
             return {"state": "calibrating", "n": len(self.cal)}
@@ -197,14 +174,10 @@ class Sonar:
         coh = np.abs(self.ema_c) / (self.ema_m + 1e-12)
 
         loud = resid > self.med + 4 * self.sigma
-        # "stale" requires SUSTAINED phase-frozen amplitude: the ema_m
-        # gate keeps a freshly appeared target (whose EMAs are dominated by
-        # one frame, faking coherence 1) from qualifying, and the run
-        # counter keeps the brief still moments of a breathing person from
-        # qualifying -- only residue frozen for ~2 s straight is absorbed
-        high = loud & (coh > COH_STALE) & (self.ema_m > 0.7 * resid)
-        self.stale_run = np.where(high, self.stale_run + 1, 0)
-        stale = self.stale_run >= STALE_RUN
+        # the ema_m gate means "stale" needs ~6 frames of sustained,
+        # phase-frozen amplitude -- a freshly appeared target (whose EMAs
+        # are dominated by one frame, faking coherence 1) is never absorbed
+        stale = loud & (coh > COH_STALE) & (self.ema_m > 0.7 * resid)
 
         # strongest live (non-stale) bin is the candidate target
         live = np.where(stale, 0.0, resid)
@@ -229,9 +202,6 @@ class Sonar:
 
         if not detected:
             self.recent.clear()
-            self.fine = None
-            self.vel = 0.0
-            self.prev_z = None
             # the noise floor may drift only while nothing is detected,
             # so a present target can never ratchet it up over itself
             q = resid[~loud]
@@ -244,28 +214,8 @@ class Sonar:
 
         lag = MIN_LAG + parabolic_peak(resid, i)
         self.recent.append(lag / FS * C / 2)
-        coarse = float(np.median(self.recent))
-
-        # Fine ranging: the residual's carrier phase at the peak turns 2*pi
-        # per lambda/2 (~9 mm) of range change -- far below the correlation
-        # peak's resolution. Derotating by each bin's own carrier phase makes
-        # the value comparable even when the peak hops to a neighbouring bin.
-        z = complex(cres[i]) * np.exp(-2j * np.pi * FC * i / FS)
-        if (self.fine is None or self.prev_z is None
-                or abs(self.fine - coarse) > FINE_SNAP):
-            self.fine = coarse                  # new target, or fine track
-            self.vel = 0.0                      # diverged (fast motion)
-        elif abs(i - self.prev_i) <= FINE_JUMP:
-            dphi = float(np.angle(z * np.conjugate(self.prev_z)))
-            step = -dphi * C / (4 * np.pi * FC)          # +: moving away
-            self.fine += step + FINE_PULL * (coarse - self.fine)
-            self.vel += VEL_A * (step / PING_PERIOD - self.vel)
-        else:
-            self.fine += FINE_PULL * (coarse - self.fine)
-        self.prev_z, self.prev_i = z, i
-
-        return {"state": "echo", "dist": float(self.fine), "coarse": coarse,
-                "vel": float(self.vel), "snr": snr, **dbg}
+        return {"state": "echo", "dist": float(np.median(self.recent)),
+                "snr": snr, **dbg}
 
 
 def bar(dist_m: float, width: int = 30) -> str:
@@ -334,12 +284,10 @@ def main() -> None:
 
                 if r["state"] == "echo":
                     d = r["dist"]
-                    line = (f"{stamp} | {d * 100:7.2f} cm "
-                            f"| {r['vel'] * 1000:+7.1f} mm/s |{bar(d)}| "
+                    line = (f"{stamp} | {d * 100:6.1f} cm |{bar(d)}| "
                             f"snr {r['snr']:5.1f}")
                 else:
-                    line = (f"{stamp} |     --- cm |     --- mm/s "
-                            f"|{'.' * 30}| no echo")
+                    line = f"{stamp} |    --- cm |{'.' * 30}| no echo"
 
                 if args.debug:
                     line += (f" | direct {r['direct_amp']:8.1f} "

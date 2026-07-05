@@ -45,14 +45,11 @@ CAL_PINGS   = 20                # pings used to learn the static background
 SNR_THRESH  = 6.0               # detection threshold (x noise sigma)
 ABS_FLOOR   = 0.002             # min echo strength relative to direct path
 BG_ADAPT    = 0.02              # slow background adaptation rate
-BG_FAST     = 0.30              # absorption rate of confirmed-stale residue
+BG_FAST     = 0.10              # fast absorption of stale (phase-frozen) residue
 REF_ADAPT   = 0.05              # direct-path reference tracking rate
 EMA_A       = 0.20              # temporal-coherence smoothing per frame
 COH_STALE   = 0.95              # residue coherence above this = static scene
                                 # change, not a live target
-STALE_RUN   = 20                # frames coherence must stay high before
-                                # absorbing -- longer than the still moment
-                                # at the extremes of a breath (~1 s)
 SIDE_REJ    = 0.10              # backstop: secondary peaks below this fraction
                                 # of the strongest are leftover fit error
 MAX_OBJ     = 3                 # max simultaneous reflectors
@@ -137,7 +134,6 @@ class Channel:
         self.sigma = 1e-9
         self.ema_c: np.ndarray | None = None  # complex residual average
         self.ema_m: np.ndarray | None = None  # residual magnitude average
-        self.stale_run: np.ndarray | None = None  # consecutive high-coh frames
 
     def process(self, X: np.ndarray) -> dict:
         corr = np.fft.ifft(X * self.h_conj)[:CORR_N]
@@ -169,7 +165,6 @@ class Channel:
                     1.4826 * np.median(np.abs(pool - self.med))) + 1e-9
                 self.ema_c = np.zeros(len(self.bg), dtype=complex)
                 self.ema_m = np.zeros(len(self.bg))
-                self.stale_run = np.zeros(len(self.bg))
                 self.cal.clear()
                 self.cal_ref.clear()
             return {"state": "calibrating"}
@@ -192,14 +187,10 @@ class Channel:
         coh = np.abs(self.ema_c) / (self.ema_m + 1e-12)
 
         loud = resid0 > self.med + 4 * self.sigma
-        # "stale" requires SUSTAINED phase-frozen amplitude: the ema_m
-        # gate keeps a freshly appeared target (whose EMAs are dominated by
-        # one frame, faking coherence 1) from qualifying, and the run
-        # counter keeps the brief still moments of a breathing person from
-        # qualifying -- only residue frozen for ~2 s straight is absorbed
-        high = loud & (coh > COH_STALE) & (self.ema_m > 0.7 * resid0)
-        self.stale_run = np.where(high, self.stale_run + 1, 0)
-        stale = self.stale_run >= STALE_RUN
+        # the ema_m gate means "stale" needs ~6 frames of sustained,
+        # phase-frozen amplitude -- a freshly appeared target (whose EMAs
+        # are dominated by one frame, faking coherence 1) is never absorbed
+        stale = loud & (coh > COH_STALE) & (self.ema_m > 0.7 * resid0)
 
         # CLEAN: detect the strongest live echo, fit its exact complex lobe
         # (sub-sample position + amplitude), subtract it, repeat
