@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>ACOUSTIC VOID — presence sensor</title>
+<style>
+  :root { color-scheme: dark; }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { height: 100%; background: #04060a; overflow: hidden; }
+  canvas { display: block; }
+  #hud {
+    position: fixed; top: 14px; left: 16px; z-index: 10;
+    font: 12px/1.6 ui-monospace, "JetBrains Mono", Menlo, monospace;
+    color: #39ff88; text-shadow: 0 0 8px rgba(57,255,136,.6);
+    letter-spacing: .12em; pointer-events: none; user-select: none;
+  }
+  #hud .dim { color: #5a6b62; text-shadow: none; }
+  #hud b { color: #eafff2; font-weight: 600; }
+  #tag {
+    position: fixed; bottom: 12px; right: 16px; z-index: 10;
+    font: 10px ui-monospace, monospace; color: #35513f; letter-spacing: .2em;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud">
+  <div>ACOUSTIC PRESENCE SENSOR</div>
+  <div class="dim">MODE <b id="mode">—</b> · RANGE <b id="rng">—</b> · TARGETS <b id="cnt">0</b></div>
+  <div class="dim" id="list"></div>
+</div>
+<div id="tag">17–21kHz · SONAR · MTMN</div>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

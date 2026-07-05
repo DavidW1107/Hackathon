@@ -1,59 +1,77 @@
-# Laptop sonar — hand-sweep room mapper
+# Acoustic void — laptop presence sensor
 
-Turn a laptop's speaker + mic into a crude acoustic sonar. Emit ultrasonic-ish
-chirps, time the echoes for range, spin the laptop through one turn for bearing,
-and get a 2D floor outline + a 3D wall extrusion.
+Turn a laptop's speaker + mic into a real-time acoustic motion sensor. It emits
+a near-inaudible 17–21 kHz chirp, listens for echoes, detects and **classifies
+moving targets** (human / hard object / falling), estimates coarse direction,
+and streams detections to a **3D "void" web viewer**: black space, steel-grey
+static clutter, glowing matrix-green humans.
+
+Intended product: a fixed sensor station watches a room; on detection it can
+text you a link; you open the viewer and see what moved.
+
+## Pieces
+
+| File | Role |
+|---|---|
+| `sonar.py` | DSP primitives — chirp + matched-filter range. `python sonar.py` self-tests. |
+| `emit_test.py` | Confirms the 17–21 kHz chirp emits + is received. `--selftest` for no-hardware. |
+| `sensor.py` | The station: emits, detects, classifies, serves detection frames as JSON. |
+| `web/` | Static three.js viewer — deploys to Vercel. Renders the void. |
 
 ## Run
 
 ```bash
-pip install -r requirements.txt      # + `sudo apt install libportaudio2` on Ubuntu
-python sonar.py --selftest           # verifies the DSP math, no hardware
-python ui.py                         # graphical: set seconds/height, click Scan, spin
-python sonar.py --seconds 12 --height 2.5   # headless, writes scan.png / scan.npy
+pip install -r requirements.txt          # + `sudo apt install libportaudio2` on Ubuntu
+
+python sensor.py --sim                    # synthetic targets, no hardware
+python sensor.py                          # live sensing (device 4 = analog mic/speaker)
+python sensor.py --sim --record web/sample.json --seconds 15   # regenerate demo data
 ```
 
-In the UI: set the sweep length + room height, click **Scan**, then spin the
-laptop ~360° at a *steady* speed until it stops. Best results: hard walls, quiet
-room, volume up.
+Viewer (local): serve `web/` and open it —
 
-## How it works
+```bash
+python -m http.server 8123 --directory web
+# open http://localhost:8123/                       -> replays web/sample.json
+# open http://localhost:8123/?sensor=http://localhost:8765  -> live from sensor.py
+```
 
-- **Range** — a 5–20 kHz linear FM chirp is emitted every 40 ms. Each echo is
-  matched-filtered (cross-correlation) against the chirp; the lag to the first
-  peak after the direct speaker→mic path gives round-trip time → distance.
-  Range resolution ≈ `c / 2B` ≈ **1 cm**.
-- **Bearing** — one speaker + one mic gives range *only*, no direction. So you
-  physically sweep the laptop and tag each echo with a heading:
-  - **Gyro** (auto-detected via Linux IIO `in_anglvel_z_raw`) → integrated yaw. Good.
-  - **No gyro** → constant-rotation-rate assumption. Rough; skews on an uneven spin.
-- **Render** — echoes become `(range, angle)` polar points → floor outline →
-  extruded to `height` for a crude 3D room shell.
+## Deploy the viewer to Vercel
 
-## Honest limits
+`web/` is a static site (three.js via CDN, no build step).
 
-- A **static** laptop cannot map a room — no bearing. The sweep is the whole trick.
-- Soft surfaces (curtains, sofas, people) reflect almost nothing → gaps.
-- Room reverb/multipath dominates past a few metres.
-- Constant-rate heading is approximate; a gyro is the real fix.
+```bash
+cd web
+vercel            # or: vercel --prod
+```
 
-## Does this exist elsewhere?
+It ships with `sample.json`, so the deployed link shows the void immediately.
+Point it at a live station with `?sensor=<url>`. Note: a Vercel (https) page
+can't reach a `http://localhost` sensor (mixed content) — for cross-device live,
+tunnel the sensor over https (ngrok) or add a relay. Same-machine local dev is fine.
 
-Yes, in pieces — but not as a single-laptop room scanner:
+## How it senses (and its honest limits)
 
-- **Acoustic rangefinding** (laptop/phone chirp + mic → distance): common demo,
-  many hobby repos. The solid, real part.
-- **Room shape from echoes**: *"Can one hear the shape of a room?"* (Dokmanić et
-  al., PNAS 2013) reconstructs room geometry from impulse-response echoes — but
-  needs a **mic array**, not one mic.
-- **Walk-and-map on one device**: *BatMapper* (MobiSys 2017) maps indoor spaces
-  from a phone's acoustics while walking. **Acoustic SLAM** (Evers & Naylor 2018)
-  is the general framework. Closest cousins to this hand-sweep hack.
-- **Commercial room-sensing-by-sound**: Sonos Trueplay / Apple HomePod sense
-  reflections to auto-tune audio — sensing, not geometry output.
-- **Consumer 3D room scanning** went to **LiDAR** (iPhone Pro, Polycam) and
-  photogrammetry, not sound.
+- **Range** — matched-filter echo timing. ~cm resolution, to a few metres.
+- **Motion** — per window of 8 pulses, static clutter is the cross-pulse *mean*
+  (grey), movement is the cross-pulse *std* (a moving echo fluctuates). One
+  common `t0` per window keeps static clutter from faking motion.
+- **Class** — reflectivity + range-spread + speed:
+  - **human/soft** — weak, range-smeared (torso + limbs). *Micro-Doppler + gait is the upgrade.*
+  - **hard** — strong, tight, coherent (door, wall).
+  - **falling** — fast + compact, accelerating.
+- **Direction** — coarse azimuth from the 2-mic time delay. Forward ~±50° cone;
+  front/back ambiguous; assumes targets are in front. `MIC_BASELINE` needs
+  calibrating per laptop.
+- **Height** — *not measured* (mics are on one horizontal line). Inferred by
+  class: human = tall column, hard = block, falling = dropping mass. Real z needs
+  a vertically-offset mic (roadmap).
 
-So: ranging is common, sound-based room *geometry* is a research thing needing
-arrays, and a one-static-mic 3D room map doesn't exist because of the bearing
-problem this repo works around by sweeping.
+Best results: one mover, quiet room, hard walls, ≤ ~4 m, laptop steady.
+
+## Roadmap
+
+- Calibrate `MIC_BASELINE` → trustworthy azimuth.
+- Micro-Doppler (proper Doppler across pulses) → better human/hard split + velocity.
+- Bistatic elevation via a second node (phone hears the chirp) → true 3D.
+- Detection → Twilio SMS with the viewer link.
