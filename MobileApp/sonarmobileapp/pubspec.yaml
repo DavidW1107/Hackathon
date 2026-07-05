@@ -39,6 +39,9 @@ dependencies:
   # and cached at runtime to match the landing page exactly.
   google_fonts: ^6.2.1
 
+  # polls the Python sonar sensor's JSON feed (http://<host>:8765/)
+  http: ^1.2.2
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

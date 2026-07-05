@@ -31,10 +31,12 @@ class RadarDisplay extends StatefulWidget {
   const RadarDisplay({
     super.key,
     required this.blips,
+    this.fovDeg = 50,
     this.armed = true,
   });
 
   final List<Blip> blips;
+  final double fovDeg;
   final bool armed;
 
   @override
@@ -80,6 +82,7 @@ class _RadarDisplayState extends State<RadarDisplay>
                       sweep: _sweep.value * 2 * math.pi,
                       ping: _ping.value,
                       armed: widget.armed,
+                      fovDeg: widget.fovDeg,
                       blips: widget.blips,
                     ),
                   );
@@ -151,12 +154,14 @@ class _RadarPainter extends CustomPainter {
     required this.sweep,
     required this.ping,
     required this.armed,
+    required this.fovDeg,
     required this.blips,
   });
 
   final double sweep;
   final double ping;
   final bool armed;
+  final double fovDeg;
   final List<Blip> blips;
 
   @override
@@ -206,26 +211,39 @@ class _RadarPainter extends CustomPainter {
       axis,
     );
 
-    // rotating conic sweep
+    // forward scan cone — our real +/-FOV field of view, pointing up
     if (armed) {
-      final sweepPaint = Paint()
-        ..shader = SweepGradient(
-          transform: GradientRotation(sweep - math.pi / 2),
-          colors: [
-            Sentra.green.withValues(alpha: 0.42),
-            Sentra.green.withValues(alpha: 0.05),
-            Colors.transparent,
-            Colors.transparent,
-          ],
-          stops: const [0.0, 0.40, 0.55, 1.0],
-        ).createShader(Rect.fromCircle(center: center, radius: r));
-      canvas.drawCircle(center, r, sweepPaint);
-
-      // bright leading edge
-      final lead = Offset(
-        center.dx + math.cos(sweep - math.pi / 2) * r,
-        center.dy + math.sin(sweep - math.pi / 2) * r,
+      final fov = fovDeg * math.pi / 180;
+      final up = -math.pi / 2;
+      final wedge = Path()
+        ..moveTo(center.dx, center.dy)
+        ..arcTo(Rect.fromCircle(center: center, radius: r), up - fov, 2 * fov, false)
+        ..close();
+      canvas.drawPath(
+        wedge,
+        Paint()
+          ..shader = RadialGradient(
+            colors: [
+              Sentra.green.withValues(alpha: 0.18),
+              Sentra.green.withValues(alpha: 0.02),
+            ],
+          ).createShader(Rect.fromCircle(center: center, radius: r)),
       );
+      // cone edges
+      final edge = Paint()
+        ..color = Sentra.green.withValues(alpha: 0.35)
+        ..strokeWidth = 1;
+      for (final s in const [-1.0, 1.0]) {
+        final a = up + s * fov;
+        canvas.drawLine(
+          center,
+          center + Offset(math.cos(a) * r, math.sin(a) * r),
+          edge,
+        );
+      }
+      // sweep line oscillating across the cone (the live "scanning" motion)
+      final a = up + fov * math.sin(sweep);
+      final lead = center + Offset(math.cos(a) * r, math.sin(a) * r);
       canvas.drawLine(
         center,
         lead,
@@ -275,5 +293,5 @@ class _RadarPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_RadarPainter old) =>
-      old.sweep != sweep || old.ping != ping || old.armed != armed;
+      old.sweep != sweep || old.ping != ping || old.armed != armed || old.fovDeg != fovDeg;
 }
