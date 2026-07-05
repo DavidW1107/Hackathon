@@ -226,9 +226,9 @@ def sim_loop():
         if int(t) % 7 == 3:                              # a door swings now and then
             targets.append({"id": 1, "range": 1.3, "az": -38, "vel": 0.9,
                             "strength": 0.7, "spread": 0.1, "class": "hard"})
-        clutter = [{"range": 3.6, "az": 6, "strength": 0.9},      # back wall (hard)
-                   {"range": 1.7, "az": -34, "strength": 0.4},    # couch (soft)
-                   {"range": 4.6, "az": 40, "strength": 0.75}]    # side wall / door (hard)
+        clutter = [{"range": 3.8, "az": 4, "strength": 0.85},     # back wall (strong)
+                   {"range": 1.8, "az": -32, "strength": 0.4},    # couch (soft)
+                   {"range": 3.0, "az": 38, "strength": 0.6}]     # doorway (medium)
         _publish(t, clutter, targets)
         i += 1
         time.sleep(FRAME_MS * PULSES_PER_WIN / 1000)

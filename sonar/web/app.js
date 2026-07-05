@@ -5,6 +5,7 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 
 const GREEN = 0x39ff88, HARD = 0xb8c2c9, SOFT = 0x6f7a74;
+const CEIL = 2.4, DOOR_H = 2.0, DOOR_W = 0.9;    // standard building dimensions (m)
 const params = new URLSearchParams(location.search);
 // live by default when viewing locally; a deployed (https) page falls back to replay.
 const isLocal = ["localhost", "127.0.0.1"].includes(location.hostname);
@@ -35,6 +36,12 @@ composer.addPass(new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight),
 const grid = new THREE.GridHelper(16, 32, 0x1c3a2b, 0x0f1f18);
 grid.position.z = 4;
 scene.add(grid);
+
+// faint ceiling grid at standard height -> the void reads as a room with scale
+const ceiling = new THREE.GridHelper(16, 16, 0x123a2a, 0x0c1712);
+ceiling.position.set(0, CEIL, 4);
+ceiling.material.transparent = true; ceiling.material.opacity = 0.12;
+scene.add(ceiling);
 
 const node = new THREE.Mesh(new THREE.SphereGeometry(0.12, 16, 16),
   new THREE.MeshBasicMaterial({ color: GREEN }));
@@ -89,26 +96,42 @@ function makeHuman() {
   };
 }
 const hardMesh = () => new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.6, 0.2),
-  new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.85 }));
+  new THREE.MeshBasicMaterial({ color: SOFT, transparent: true, opacity: 0.55 }));
 const fallingMesh = () => new THREE.Mesh(new THREE.IcosahedronGeometry(0.22, 0),
   new THREE.MeshBasicMaterial({ color: HARD }));
 
-// ---------- static clutter: hard slab vs soft blob ----------
+// ---------- snap static reflectors to standard architectural elements ----------
+// ponytail: strength -> type is a heuristic (sonar can't truly separate wall/door/
+// sofa); the DIMENSIONS are standard building sizes so proportions read true.
+function makeWall() {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(1.2, CEIL, 0.08),
+    new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.13 }));
+  m.userData.y = CEIL / 2; return m;
+}
+function makeDoor() {                                  // 2.0m x 0.9m frame (6'6" doorway)
+  const g = new THREE.Group();
+  const fm = new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.5 });
+  const th = 0.06;
+  const bar = (w, h, x, y) => { const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, th), fm); m.position.set(x, y, 0); return m; };
+  g.add(bar(DOOR_W + th, th, 0, DOOR_H),               // lintel + two posts
+        bar(th, DOOR_H, -DOOR_W / 2, DOOR_H / 2), bar(th, DOOR_H, DOOR_W / 2, DOOR_H / 2));
+  const panel = new THREE.Mesh(new THREE.BoxGeometry(DOOR_W, DOOR_H, 0.02),
+    new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.07 }));
+  panel.position.y = DOOR_H / 2; g.add(panel);
+  g.userData.y = 0; return g;
+}
+function makeCouch() {                                 // soft furniture ~1.8 x 0.8 x 0.9m
+  const m = new THREE.Mesh(new THREE.BoxGeometry(1.8, 0.8, 0.9),
+    new THREE.MeshBasicMaterial({ color: SOFT, transparent: true, opacity: 0.28 }));
+  m.userData.y = 0.4; return m;
+}
 function buildClutter(f) {
   clutterGroup.clear();
   for (const c of f.clutter || []) {
     const p = place(c.range, c.az);
-    let m;
-    if (c.strength > 0.6) {                            // strong reflector -> wall/door slab
-      m = new THREE.Mesh(new THREE.BoxGeometry(0.9, 1.6, 0.08),
-        new THREE.MeshBasicMaterial({ color: HARD, transparent: true, opacity: 0.08 + 0.14 * c.strength }));
-      m.position.set(p.x, 0.8, p.z);
-    } else {                                           // weak reflector -> soft furniture blob
-      m = new THREE.Mesh(new THREE.BoxGeometry(0.85, 0.5, 0.6),
-        new THREE.MeshBasicMaterial({ color: SOFT, transparent: true, opacity: 0.3 }));
-      m.position.set(p.x, 0.25, p.z);
-    }
-    m.lookAt(0, m.position.y, 0);
+    const m = c.strength > 0.7 ? makeWall() : c.strength > 0.45 ? makeDoor() : makeCouch();
+    m.position.set(p.x, m.userData.y, p.z);
+    m.lookAt(0, m.userData.y, 0);                      // face the sensor
     clutterGroup.add(m);
   }
 }
