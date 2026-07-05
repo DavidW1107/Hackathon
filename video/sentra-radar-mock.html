@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SENTRA — radar mock (B-roll)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --bg:#070A09; --bgRaise:#0B0F0D; --bgPanel:#0E1512;
+    --ink:#E6F2EA; --inkDim:#8AA396; --inkFaint:#5C7266;
+    --green:#22E06B; --greenBright:#5BFFA0; --greenSoft:#8DFFB0; --amber:#FFD166;
+    --lineGreen:rgba(52,226,122,.14); --lineMid:rgba(52,226,122,.30);
+  }
+  *{margin:0;box-sizing:border-box}
+  html,body{width:1280px;height:720px;overflow:hidden;background:
+    radial-gradient(120% 90% at 50% 0%, #0c1712 0%, #070A09 60%);
+    font-family:"IBM Plex Sans",system-ui,sans-serif;color:var(--ink)}
+  .stage{width:1280px;height:720px;display:flex;align-items:center;justify-content:center;gap:64px}
+  /* left caption column */
+  .caption{width:360px}
+  .caption .ey{font-family:"IBM Plex Mono",monospace;font-size:13px;letter-spacing:.28em;
+    color:var(--green);text-transform:uppercase;margin-bottom:18px}
+  .caption h1{font-family:"Space Grotesk",sans-serif;font-weight:600;font-size:52px;
+    line-height:1.02;letter-spacing:-.02em;margin-bottom:18px}
+  .caption h1 em{font-style:normal;color:var(--greenBright)}
+  .caption p{color:var(--inkDim);font-size:16px;line-height:1.6;max-width:330px}
+  .tag{display:inline-flex;align-items:center;gap:8px;margin-top:26px;
+    font-family:"IBM Plex Mono",monospace;font-size:12px;letter-spacing:.15em;color:var(--inkDim)}
+  .dot{width:9px;height:9px;border-radius:50%;background:var(--greenBright);
+    box-shadow:0 0 12px var(--greenBright)}
+  /* phone */
+  .phone{width:330px;height:670px;border-radius:44px;padding:14px;
+    background:linear-gradient(160deg,#141b18,#090c0b);
+    border:1px solid rgba(91,255,160,.18);
+    box-shadow:0 40px 90px rgba(0,0,0,.6), 0 0 60px rgba(34,224,107,.10)}
+  .screen{width:100%;height:100%;border-radius:32px;background:var(--bg);
+    overflow:hidden;position:relative;padding:22px 20px}
+  .notch{position:absolute;top:12px;left:50%;transform:translateX(-50%);
+    width:96px;height:22px;background:#050706;border-radius:12px}
+  .k{font-family:"IBM Plex Mono",monospace;font-size:10.5px;letter-spacing:.24em;
+    color:var(--green);text-transform:uppercase;margin-top:20px}
+  .title{font-family:"Space Grotesk",sans-serif;font-weight:600;font-size:26px;
+    margin-top:8px;letter-spacing:-.01em}
+  .sub{color:var(--inkDim);font-size:11.5px;line-height:1.5;margin-top:6px}
+  canvas{display:block;margin:14px auto 0;width:250px;height:250px}
+  .stats{display:flex;gap:0;margin-top:16px;border:1px solid var(--lineGreen);
+    border-radius:12px;background:var(--bgRaise);overflow:hidden}
+  .stat{flex:1;padding:12px 8px;text-align:center}
+  .stat + .stat{border-left:1px solid var(--lineGreen)}
+  .stat .v{font-family:"Space Grotesk",sans-serif;font-weight:600;font-size:19px}
+  .stat .v.g{color:var(--greenBright)}
+  .stat .u{font-size:10px;color:var(--inkDim)}
+  .stat .l{font-family:"IBM Plex Mono",monospace;font-size:8.5px;letter-spacing:.12em;
+    color:var(--inkFaint);text-transform:uppercase;margin-top:4px}
+  .status{display:flex;align-items:center;gap:10px;margin-top:12px;padding:12px 14px;
+    border:1px solid var(--lineMid);border-radius:12px;background:var(--bgPanel)}
+  .status .t{flex:1;font-size:12px;font-weight:500}
+  .status .m{font-family:"IBM Plex Mono",monospace;font-size:10px;color:var(--inkDim)}
+</style>
+</head>
+<body>
+<div class="stage">
+  <div class="caption">
+    <div class="ey">Acoustic presence sensor</div>
+    <h1>Your laptop is<br>the <em>alarm.</em></h1>
+    <p>SENTRA turns the device you already own into a motion sensor — near-inaudible sound maps the room and flags anything that moves.</p>
+    <div class="tag"><span class="dot"></span>LIVE · 17–21 kHz · no new hardware</div>
+  </div>
+
+  <div class="phone">
+    <div class="screen">
+      <div class="notch"></div>
+      <div class="k">02 · Live sweep</div>
+      <div class="title">Room A4</div>
+      <div class="sub">Sweeping the space in front of the station. Green pings are moving reflectors picked out of the static room.</div>
+      <canvas id="r" width="500" height="500"></canvas>
+      <div class="stats">
+        <div class="stat"><span class="v">17–21</span><span class="u"> kHz</span><div class="l">Sweep freq</div></div>
+        <div class="stat"><span class="v">2.0</span><span class="u"> m</span><div class="l">Range gate</div></div>
+        <div class="stat"><span class="v g" id="cnt">1</span><div class="l">Targets</div></div>
+      </div>
+      <div class="status">
+        <span class="dot"></span>
+        <span class="t">Live · SENTRA station</span>
+        <span class="m" id="mv">1 moving</span>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const cv = document.getElementById('r'), g = cv.getContext('2d');
+const W = 500, cx = 250, cy = 250, R = 238, FOV = 50 * Math.PI/180, UP = -Math.PI/2;
+// intruder tracks: [range 0..1 of radius, azimuth deg]. one walker crossing the cone.
+let t0 = performance.now();
+function targets(t){
+  const az = 34 * Math.sin(t*0.55);           // pace left<->right
+  const rng = 0.62 + 0.12*Math.sin(t*0.9);
+  const list = [{r:rng, az:az}];
+  return list;
+}
+function draw(now){
+  const t = (now - t0)/1000;
+  g.clearRect(0,0,W,W);
+  // glow
+  let rg = g.createRadialGradient(cx,cy,0,cx,cy,R);
+  rg.addColorStop(0,'rgba(34,224,107,.10)'); rg.addColorStop(.7,'transparent');
+  g.fillStyle=rg; g.beginPath(); g.arc(cx,cy,R,0,7); g.fill();
+  // rings
+  for(let i=0;i<4;i++){ g.beginPath(); g.arc(cx,cy,R*(1-i*.235),0,7);
+    g.strokeStyle='rgba(34,224,107,'+(.12+i*.06)+')'; g.lineWidth=1; g.stroke(); }
+  // crosshair
+  g.strokeStyle='rgba(34,224,107,.10)'; g.lineWidth=1;
+  g.beginPath(); g.moveTo(cx,cy-R); g.lineTo(cx,cy+R); g.moveTo(cx-R,cy); g.lineTo(cx+R,cy); g.stroke();
+  // forward cone wedge
+  g.beginPath(); g.moveTo(cx,cy); g.arc(cx,cy,R,UP-FOV,UP+FOV); g.closePath();
+  let cg = g.createRadialGradient(cx,cy,0,cx,cy,R);
+  cg.addColorStop(0,'rgba(34,224,107,.18)'); cg.addColorStop(1,'rgba(34,224,107,.02)');
+  g.fillStyle=cg; g.fill();
+  // cone edges
+  g.strokeStyle='rgba(34,224,107,.35)'; g.lineWidth=1;
+  for(const s of [-1,1]){ const a=UP+s*FOV; g.beginPath(); g.moveTo(cx,cy);
+    g.lineTo(cx+Math.cos(a)*R, cy+Math.sin(a)*R); g.stroke(); }
+  // sweep line
+  const sa = UP + FOV*Math.sin(t*1.2);
+  const lx=cx+Math.cos(sa)*R, ly=cy+Math.sin(sa)*R;
+  let lg=g.createLinearGradient(cx,cy,lx,ly);
+  lg.addColorStop(0,'rgba(91,255,160,.7)'); lg.addColorStop(1,'transparent');
+  g.strokeStyle=lg; g.lineWidth=1.6; g.beginPath(); g.moveTo(cx,cy); g.lineTo(lx,ly); g.stroke();
+  // blips (green pings)
+  const ts = targets(t);
+  for(let i=0;i<ts.length;i++){
+    const a = ts[i].az*Math.PI/180, fr = ts[i].r;
+    const x = cx + fr*R*Math.sin(a), y = cy - fr*R*Math.cos(a);
+    const ph = (t*0.5 + i*0.4)%1;
+    g.beginPath(); g.arc(x,y,6+ph*26,0,7);
+    g.strokeStyle='rgba(91,255,160,'+((1-ph)*.6)+')'; g.lineWidth=1; g.stroke();
+    g.beginPath(); g.arc(x,y,9,0,7); g.fillStyle='rgba(91,255,160,.28)'; g.fill();
+    g.beginPath(); g.arc(x,y,4,0,7); g.fillStyle='#5BFFA0'; g.fill();
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
