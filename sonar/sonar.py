@@ -28,7 +28,9 @@ import numpy as np
 
 FS = 48000            # sample rate (Hz)
 C = 343.0             # speed of sound (m/s)
-F0, F1 = 5000, 20000  # chirp band (Hz) — inside laptop speaker/mic range
+F0, F1 = 17000, 21000  # near-inaudible band (most adults can't hear >17kHz)
+# ponytail: narrower band B=4kHz -> range res ~c/2B ~4cm (was ~1cm at 5-20kHz).
+# Higher freq also = weaker speaker output/echo; drop NOISE_FLOOR if scans come back empty.
 CHIRP_MS = 6          # chirp length
 FRAME_MS = 40         # emit period per chirp -> max range ~6.8 m
 MIN_RANGE = 0.15      # blind zone (m): gate out speaker->mic crosstalk
