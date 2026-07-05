@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <script src="https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/gsap.min.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet" />
+    <style>
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { width: 1920px; height: 1080px; overflow: hidden; background: #05070a; }
+      :root {
+        --bg:#070A09; --ink:#E6F2EA; --inkDim:#8AA396; --inkFaint:#5C7266;
+        --green:#22E06B; --greenBright:#5BFFA0; --greenSoft:#8DFFB0; --amber:#FFD166;
+      }
+      .clip { position: absolute; inset: 0; }
+      .bgfill { position: absolute; inset: 0;
+        background: radial-gradient(120% 90% at 50% 0%, #0c1712 0%, #070A09 55%, #04060a 100%); }
+      .grain { position:absolute; inset:0; opacity:.5; mix-blend-mode:screen;
+        background-image:radial-gradient(rgba(52,226,122,.05) 1px, transparent 1px);
+        background-size:5px 5px; }
+      .scene { display:flex; flex-direction:column; justify-content:center;
+        width:100%; height:100%; padding:150px 200px; }
+      .fill { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+      .ey { font-family:"IBM Plex Mono",monospace; font-size:26px; letter-spacing:.34em;
+        color:var(--green); text-transform:uppercase; margin-bottom:34px; }
+      .h { font-family:"Space Grotesk","IBM Plex Sans",sans-serif; font-weight:600;
+        font-size:104px; line-height:1.02; letter-spacing:-.02em; color:var(--ink); }
+      .h em { font-style:normal; color:var(--greenBright); }
+      .sub { font-family:"IBM Plex Sans",sans-serif; font-size:34px; line-height:1.5;
+        color:var(--inkDim); margin-top:34px; max-width:1200px; }
+      .rows { margin-top:44px; display:flex; flex-direction:column; gap:22px; }
+      .row { display:flex; align-items:center; gap:22px; font-family:"IBM Plex Sans",sans-serif;
+        font-size:36px; color:var(--ink); }
+      .row .d { width:14px; height:14px; border-radius:50%; background:var(--greenBright);
+        box-shadow:0 0 16px var(--greenBright); flex:none; }
+      .tl { position:absolute; top:70px; left:80px; font-family:"IBM Plex Mono",monospace;
+        font-size:20px; letter-spacing:.24em; color:var(--inkDim); }
+      .br { position:absolute; bottom:66px; right:88px; font-family:"IBM Plex Mono",monospace;
+        font-size:19px; letter-spacing:.2em; color:var(--inkDim); }
+      .rule { position:absolute; left:200px; right:200px; bottom:132px; height:1px;
+        background:rgba(52,226,122,.16); }
+      .mark { position:absolute; width:26px; height:26px; }
+      .wm { position:absolute; top:66px; right:88px; font-family:"IBM Plex Mono",monospace;
+        font-size:22px; letter-spacing:.3em; color:var(--green); }
+    </style>
+  </head>
+  <body>
+    <div id="root" data-composition-id="main" data-start="0" data-duration="166"
+         data-width="1920" data-height="1080">
+
+      <div id="bg" class="clip" data-start="0" data-duration="166" data-track-index="0">
+        <div class="bgfill"></div><div class="grain"></div>
+      </div>
+
+      <div id="s1" class="clip scene" data-start="0" data-duration="24" data-track-index="1">
+        <div class="tl">SENTRA // 01</div>
+        <div class="mark" style="top:70px;right:80px;border-top:1px solid rgba(52,226,122,.3);border-right:1px solid rgba(52,226,122,.3)"></div>
+        <div class="ey">01 — The problem</div>
+        <div class="h s1a">Students get robbed.<br><em>Security doesn't fit a student budget.</em></div>
+        <div class="sub s1b">Alarms, motion sensors, installation, subscriptions — built for homeowners, not the room you rent.</div>
+        <div class="rule"></div>
+        <div class="br">DUHALLOW · CO. CORK</div>
+      </div>
+
+      <div id="s2" class="clip scene" data-start="24" data-duration="24" data-track-index="1">
+        <div class="tl">SENTRA // 02</div>
+        <div class="ey">02 — The idea</div>
+        <div class="h s2a">Your laptop is<br>the <em>alarm.</em></div>
+        <div class="sub s2b">SENTRA turns the device you already own into a motion sensor. No extra hardware. Nothing to install. Arm it, and walk out the door.</div>
+        <div class="rule"></div>
+        <div class="br">NO NEW HARDWARE</div>
+      </div>
+
+      <div id="s3" class="clip scene" data-start="48" data-duration="22" data-track-index="1">
+        <div class="tl">SENTRA // 03</div>
+        <div class="ey">03 — Armed</div>
+        <div class="h s3a">It drops into a<br><em>false sleep.</em></div>
+        <div class="sub s3b">Screen dark. Silent. Sipping battery — a laptop closed for the night. Underneath, it's wide awake and listening.</div>
+        <div class="rule"></div>
+        <div class="br">LOW-POWER · LISTENING</div>
+      </div>
+
+      <div id="s4" class="clip" data-start="70" data-duration="32" data-track-index="1">
+        <img id="methodImg" class="fill" src="assets/sentra-method-1.png" alt="method" />
+        <div class="wm">SENTRA</div>
+      </div>
+
+      <div id="s5" class="clip" data-start="102" data-duration="32" data-track-index="1">
+        <img id="radarImg" class="fill" src="assets/sentra-broll-1.png" alt="app" />
+        <div class="wm">SENTRA</div>
+      </div>
+
+      <div id="s6" class="clip scene" data-start="134" data-duration="18" data-track-index="1">
+        <div class="tl">SENTRA // 04</div>
+        <div class="ey">04 — Where it guards</div>
+        <div class="h s6a" style="font-size:80px">Anywhere you leave<br>your stuff.</div>
+        <div class="rows">
+          <div class="row s6r"><span class="d"></span>Your dorm, while you're in lectures</div>
+          <div class="row s6r"><span class="d"></span>A shared house where people come and go</div>
+          <div class="row s6r"><span class="d"></span>A library desk while you grab a coffee</div>
+        </div>
+        <div class="rule"></div>
+        <div class="br">PRESENCE · FLAGGED</div>
+      </div>
+
+      <div id="s7" class="clip scene" data-start="152" data-duration="14" data-track-index="1"
+           style="align-items:center;text-align:center">
+        <div class="ey s7a" style="margin-bottom:26px">No hardware · no subscription · free</div>
+        <div class="h s7b" style="font-size:132px">SENTRA</div>
+        <div class="sub s7c" style="text-align:center;color:var(--greenSoft);margin-left:auto;margin-right:auto">Your laptop is the alarm.</div>
+      </div>
+    </div>
+
+    <script>
+      window.__timelines = window.__timelines || {};
+      const tl = gsap.timeline({ paused: true });
+      const inAt = (sel, t, extra = {}) =>
+        tl.from(sel, Object.assign({ opacity: 0, y: 40, duration: 0.9, ease: "power3.out" }, extra), t);
+
+      inAt("#s1 .ey", 0.2); inAt("#s1 .s1a", 0.4); inAt("#s1 .s1b", 0.9);
+      inAt("#s2 .ey", 24.2); inAt("#s2 .s2a", 24.4); inAt("#s2 .s2b", 24.9);
+      inAt("#s3 .ey", 48.2); inAt("#s3 .s3a", 48.4); inAt("#s3 .s3b", 48.9);
+
+      tl.from("#methodImg", { opacity: 0, duration: 1.0 }, 70);
+      tl.fromTo("#methodImg", { scale: 1.0 }, { scale: 1.06, duration: 32, ease: "none" }, 70);
+
+      tl.from("#radarImg", { opacity: 0, duration: 1.0 }, 102);
+      tl.fromTo("#radarImg", { scale: 1.06 }, { scale: 1.0, duration: 32, ease: "none" }, 102);
+
+      inAt("#s6 .ey", 134.2); inAt("#s6 .s6a", 134.4);
+      tl.from("#s6 .s6r", { opacity: 0, x: -30, duration: 0.7, stagger: 0.25, ease: "power3.out" }, 135.0);
+
+      inAt("#s7 .s7a", 152.3); inAt("#s7 .s7b", 152.5, { y: 60, duration: 1.1 }); inAt("#s7 .s7c", 153.2);
+
+      window.__timelines["main"] = tl;
+    </script>
+  </body>
+</html>

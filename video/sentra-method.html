@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>SENTRA — method diagram (B-roll)</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{--bg:#070A09;--ink:#E6F2EA;--inkDim:#8AA396;--inkFaint:#5C7266;
+    --green:#22E06B;--greenBright:#5BFFA0;--amber:#FFD166}
+  *{margin:0;box-sizing:border-box}
+  html,body{width:1280px;height:720px;overflow:hidden;
+    background:radial-gradient(120% 90% at 50% 10%,#0c1712 0%,#070A09 60%);
+    font-family:"IBM Plex Sans",system-ui,sans-serif;color:var(--ink)}
+  #c{position:absolute;inset:0}
+  .ey{position:absolute;top:52px;left:64px;font-family:"IBM Plex Mono",monospace;
+    font-size:13px;letter-spacing:.28em;color:var(--green);text-transform:uppercase}
+  h1{position:absolute;top:74px;left:64px;font-family:"Space Grotesk",sans-serif;
+    font-weight:600;font-size:44px;letter-spacing:-.02em}
+  h1 em{font-style:normal;color:var(--greenBright)}
+  .steps{position:absolute;left:64px;right:64px;bottom:54px;display:flex;gap:22px}
+  .step{flex:1;border:1px solid rgba(52,226,122,.16);border-radius:12px;
+    background:rgba(11,15,13,.7);padding:16px 18px}
+  .step .n{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--green);letter-spacing:.1em}
+  .step .t{font-size:14px;margin-top:8px;line-height:1.45;color:var(--ink)}
+  .lab{position:absolute;font-family:"IBM Plex Mono",monospace;font-size:11px;letter-spacing:.12em}
+  #lEmit{left:250px;top:470px;color:var(--green)}
+  #lRoom{left:430px;top:206px;color:var(--inkDim)}
+  #lMot{left:748px;top:286px;color:var(--amber)}
+</style>
+</head>
+<body>
+<canvas id="c" width="1280" height="720"></canvas>
+<div class="ey">How it works</div>
+<h1>Sound that <em>maps the room.</em></h1>
+<div class="lab" id="lEmit">17–21 kHz · inaudible &rarr;</div>
+<div class="lab" id="lRoom">&larr; echoes map the still room</div>
+<div class="lab" id="lMot">▲ movement flagged</div>
+<div class="steps">
+  <div class="step"><div class="n">01</div><div class="t">Your laptop emits near-inaudible sound.</div></div>
+  <div class="step"><div class="n">02</div><div class="t">Echoes off walls & furniture learn the empty room.</div></div>
+  <div class="step"><div class="n">03</div><div class="t">A person moves, the echo shifts &mdash; SENTRA flags it.</div></div>
+</div>
+<script>
+const cv=document.getElementById('c'),g=cv.getContext('2d');
+const E={x:300,y:392}, F={x:800,y:392}, WALL=1150, maxR=900, FIG=F.x-E.x; // 500
+const t0=performance.now();
+function laptop(){
+  g.strokeStyle='rgba(91,255,160,.85)';g.lineWidth=2;g.fillStyle='rgba(34,224,107,.08)';
+  g.beginPath();g.moveTo(E.x-42,E.y+14);g.lineTo(E.x+54,E.y+14);g.lineTo(E.x+40,E.y+2);g.lineTo(E.x-32,E.y+2);g.closePath();g.fill();g.stroke();
+  g.beginPath();g.moveTo(E.x-32,E.y+2);g.lineTo(E.x+40,E.y+2);g.lineTo(E.x+30,E.y-52);g.lineTo(E.x-42,E.y-52);g.closePath();g.fill();g.stroke();
+}
+function figure(glow){
+  const x=F.x,y=F.y;
+  g.strokeStyle='rgba(91,255,160,'+(0.5+0.5*glow)+')';
+  g.fillStyle='rgba(34,224,107,'+(0.10+0.25*glow)+')';
+  g.lineWidth=3;g.lineCap='round';
+  g.beginPath();g.arc(x,y-58,12,0,7);g.fill();g.stroke();                 // head
+  g.beginPath();g.moveTo(x,y-42);g.lineTo(x,y-2);g.stroke();              // torso
+  g.beginPath();g.moveTo(x,y-2);g.lineTo(x-11,y+34);g.moveTo(x,y-2);g.lineTo(x+11,y+34);g.stroke(); // legs
+  g.beginPath();g.moveTo(x,y-36);g.lineTo(x-16,y-12);g.moveTo(x,y-36);g.lineTo(x+16,y-12);g.stroke(); // arms
+}
+function draw(now){
+  const t=(now-t0)/1000; g.clearRect(0,0,1280,720);
+  // floor + wall
+  g.strokeStyle='rgba(52,226,122,.10)';g.lineWidth=1;
+  g.beginPath();g.moveTo(120,560);g.lineTo(1180,560);g.stroke();
+  g.strokeStyle='rgba(52,226,122,.22)';g.lineWidth=2;
+  g.beginPath();g.moveTo(WALL,210);g.lineTo(WALL,560);g.stroke();
+  for(let y=220;y<560;y+=26){g.globalAlpha=.5;g.beginPath();g.moveTo(WALL,y);g.lineTo(WALL+14,y-10);g.stroke();g.globalAlpha=1;}
+  // outgoing waves (expanding, opening right)
+  let glow=0;
+  for(let k=0;k<5;k++){
+    const r=((t*150)+k*180)%maxR;
+    const a=Math.max(0,1-r/maxR);
+    g.beginPath();g.arc(E.x,E.y,Math.max(0,r),-1.02,1.02);
+    g.strokeStyle='rgba(34,224,107,'+(a*0.55)+')';g.lineWidth=2;g.stroke();
+    glow=Math.max(glow,Math.max(0,1-Math.abs(r-FIG)/70));   // person lit as a wave passes
+  }
+  // return echo waves (faint, contracting toward laptop from the figure)
+  for(let k=0;k<3;k++){
+    const r=((t*150)+k*300+FIG)%maxR;
+    if(r<FIG) continue;
+    const rr=r-FIG, a=Math.max(0,1-rr/FIG);
+    g.beginPath();g.arc(F.x,F.y,Math.max(0,rr),Math.PI-0.9,Math.PI+0.9);
+    g.strokeStyle='rgba(141,255,176,'+(a*0.35)+')';g.lineWidth=1.4;g.stroke();
+  }
+  laptop();
+  figure(glow);
+  // motion ping on the person
+  const ph=(t*0.7)%1;
+  g.beginPath();g.arc(F.x,F.y-24,Math.max(0,14+ph*40),0,7);
+  g.strokeStyle='rgba(255,209,102,'+((1-ph)*0.6*(0.4+0.6*glow))+')';g.lineWidth=2;g.stroke();
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
