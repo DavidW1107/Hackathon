@@ -211,7 +211,7 @@ const CTRLS = [
   ["arch", 0, 1, 0.05, "structure opacity"],
   ["smooth", 0.03, 0.5, 0.01, "motion smoothing"],
   ["trail", 0, 120, 5, "trail length"],
-  ["motion", 0.05, 0.4, 0.01, "sensitivity (live)"],
+  ["motion", 0.05, 0.4, 0.01, "motion thresh ←more"],
 ];
 function applyCfg(k) {
   if (k === "bloom") bloom.strength = CFG.bloom;
