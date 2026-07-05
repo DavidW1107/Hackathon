@@ -45,10 +45,11 @@ FOV = 50                      # forward cone half-angle (deg) we trust azimuth w
 # detection thresholds (tune live) — ponytail: hand-tuned heuristics, swap for a
 # trained classifier if it misfires.
 CLUTTER_THRESH = 0.45         # fraction of peak = a static reflector
-MOTION_THRESH = 0.15          # cross-pulse std (normalised) = movement
+MOTION_THRESH = 0.20          # motion margin ABOVE the noise-floor median (adaptive)
 FALL_SPEED = 2.0              # m/s and tight -> falling/thrown
 SPREAD_HUMAN = 0.30           # range-spread (m) or weak echo -> soft/human
 SENSOR_MIN = 0.5              # m; skip near-field crosstalk zone (false motion)
+MIN_VEL = 0.10                # m/s; reject targets not actually translating (phantoms)
 
 # azimuth calibration (baseline in m + sign), overridden by calib.json if present
 CALIB_FILE = os.path.join(os.path.dirname(__file__), "calib.json")
@@ -125,7 +126,7 @@ def process_window(rec2, chirp, flen):
     t0 = int(np.argmax(np.sum([c[:L] for c in corrs], 0)))
     nb = min(maxlag, L - t0) - minlag
     if nb <= 0:
-        return [], []
+        return [], [], {"peak": 0.0, "med": 0.0, "thr": 0.0, "raw": 0}
     prof = np.vstack([c[t0 + minlag:t0 + minlag + nb] for c in corrs])
     rng = (minlag + np.arange(nb)) / FS * C / 2
     mean_p = prof.mean(0)
@@ -133,6 +134,11 @@ def process_window(rec2, chirp, flen):
     mean_n = mean_p / norm
     motion_n = prof.std(0) / norm
     gate = rng >= SENSOR_MIN                        # drop near-field crosstalk
+    mg = motion_n[gate]
+    med = float(np.median(mg)) if mg.size else 0.0
+    eff = _cfg["motion"] + med                      # adaptive: margin above noise floor
+    dbg = {"peak": round(float(mg.max()), 3) if mg.size else 0.0,
+           "med": round(med, 3), "thr": round(eff, 3), "raw": 0}
 
     clutter = [{"range": round(float(rng[i]), 2),
                 "az": round(_az_at(rec2, flen, t0, minlag, i, P), 1),
@@ -140,7 +146,9 @@ def process_window(rec2, chirp, flen):
                for i in _peaks(mean_n * gate, rng, CLUTTER_THRESH, min_sep=0.5, cap=6)]
 
     targets = []
-    for a, b in _clusters((motion_n > _cfg["motion"]) & gate):
+    clusters = _clusters((motion_n > eff) & gate)
+    dbg["raw"] = len(clusters)
+    for a, b in clusters:
         spread = float(rng[b] - rng[a])
         if spread > 1.5:                            # spans half the room = misalign/noise
             continue
@@ -149,6 +157,8 @@ def process_window(rec2, chirp, flen):
         pk_bins = prof[:, max(a - 1, 0):b + 2].argmax(1) + max(a - 1, 0)
         rt = (minlag + pk_bins) / FS * C / 2
         speed = float(np.clip(abs(rt[-1] - rt[0]) / (P * FRAME_MS / 1000), 0, 5))
+        if speed < MIN_VEL:                         # not translating -> phantom, skip
+            continue
         az = _az_at(rec2, flen, t0, minlag, peak, P)
         targets.append({"id": 0, "range": round(float(rng[peak]), 2),
                         "az": round(az, 1), "vel": round(speed, 2),
@@ -158,7 +168,7 @@ def process_window(rec2, chirp, flen):
     targets = targets[:3]
     for i, t in enumerate(targets):
         t["id"] = i; t.pop("_m")
-    return clutter, targets
+    return clutter, targets, dbg
 
 
 def _peaks(y, rng, thresh, min_sep=0.25, cap=14):
@@ -198,11 +208,12 @@ def live_loop():
     emit = np.tile(fr, PULSES_PER_WIN) * 0.8
     t_start = time.monotonic()
     prev = []
-    print(f"live sensing on device {DEVICE}")
+    print(f"live sensing on device {DEVICE}  (thr={_cfg['motion']:.3f})")
+    print(f"tune live:  curl 'http://localhost:{PORT}/config?motion=0.12'\n")
     while True:
         rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
         try:
-            clutter, targets = process_window(rec, chirp, flen)
+            clutter, targets, dbg = process_window(rec, chirp, flen)
         except Exception as e:
             print("process error:", e); continue
         # 2-window persistence: real movers corroborate across frames within ~0.4 m.
@@ -210,7 +221,9 @@ def live_loop():
         prev = [t["range"] for t in targets]
         for i, t in enumerate(matched):
             t["id"] = i
-        _publish(time.monotonic() - t_start, clutter, matched)
+        ts = time.monotonic() - t_start
+        _publish(ts, clutter, matched)
+        _log(ts, dbg, matched)
 
 
 def sim_loop():
@@ -238,6 +251,14 @@ def sim_loop():
 def _publish(t, clutter, targets):
     with _lock:
         _latest.update(t=round(t, 2), clutter=clutter, targets=targets)
+
+
+def _log(ts, dbg, targets):
+    """One concise line per window for terminal debugging + sensitivity tuning."""
+    det = "  ".join(f"{t['class'][:4].upper()} r={t['range']:.2f} az={t['az']:+05.1f} "
+                    f"v={t['vel']:.2f} s={t['strength']:.2f}" for t in targets)
+    print(f"t={ts:6.1f}  peak={dbg['peak']:.3f} med={dbg['med']:.3f} thr={dbg['thr']:.3f}"
+          f"  raw={dbg['raw']} shown={len(targets)}  |  {det or 'quiet'}", flush=True)
 
 
 def calibrate(angle_deg):
@@ -313,7 +334,12 @@ if __name__ == "__main__":
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (with --record)")
     ap.add_argument("--calibrate", type=float, metavar="DEG",
                     help="calibrate azimuth: reflector at this known angle (right +)")
+    ap.add_argument("--motion", type=float, metavar="THR",
+                    help="initial motion threshold (default from MOTION_THRESH); tune live via /config")
     a = ap.parse_args()
+
+    if a.motion is not None:
+        _cfg["motion"] = a.motion
 
     if a.calibrate is not None:
         calibrate(a.calibrate)
