@@ -95,6 +95,10 @@ const hardMesh = () => new THREE.Mesh(new THREE.BoxGeometry(0.5, 0.6, 0.2),
   new THREE.MeshBasicMaterial({ color: SOFT, transparent: true, opacity: 0.55 }));
 const fallingMesh = () => new THREE.Mesh(new THREE.IcosahedronGeometry(0.22, 0),
   new THREE.MeshBasicMaterial({ color: HARD }));
+const moverMesh = () => {                              // generic "motion" marker (class archived)
+  const g = new THREE.CylinderGeometry(0.18, 0.18, 1.2, 12); g.translate(0, 0.6, 0);
+  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: GREEN, transparent: true, opacity: 0.8 }));
+};
 
 // ---------- snap static reflectors to standard architectural elements ----------
 function makeWall() {
@@ -140,11 +144,15 @@ function addTracked(cls, pos) {
   let mesh, human = null, trail = null, trailPts = null;
   if (cls === "human") {
     const h = makeHuman(); mesh = h.group; human = h;
+  } else if (cls === "motion") {
+    mesh = moverMesh();
+  } else mesh = cls === "falling" ? fallingMesh() : hardMesh();
+  if (cls === "human" || cls === "motion") {           // movers leave a trail
     trailPts = [];
     trail = new THREE.Line(new THREE.BufferGeometry(),
       new THREE.LineBasicMaterial({ color: GREEN, transparent: true, opacity: 0.4 }));
     scene.add(trail);
-  } else mesh = cls === "falling" ? fallingMesh() : hardMesh();
+  }
   mesh.position.copy(pos); scene.add(mesh);
   const t = { mesh, human, cls, pos: pos.clone(), tgt: pos.clone(), vel: 0, seen: true, trail, trailPts };
   tracked.push(t); return t;
@@ -197,6 +205,8 @@ function animate() {
     if (t.human) {
       t.human.update(dt, t.vel);
       if (dir.length() > 0.03) t.mesh.rotation.y = Math.atan2(dir.x, dir.z);
+    }
+    if (t.trailPts) {
       const p = t.pos.clone(); p.y = 0.05;
       t.trailPts.push(p); while (t.trailPts.length > 40) t.trailPts.shift();
       t.trail.geometry.setFromPoints(t.trailPts);

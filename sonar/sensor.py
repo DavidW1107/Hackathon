@@ -179,7 +179,7 @@ def process_window(rec2, chirp, flen):
         targets.append({"id": 0, "range": round(float(rng[peak]), 2), "az": round(az, 1),
                         "vel": 0.0, "strength": round(strength, 2),
                         "spread": round(min(spread, 1.0), 2),
-                        "class": classify(strength, spread, 0.0), "_m": float(residn[peak])})
+                        "class": "motion", "_m": float(residn[peak])})
     targets.sort(key=lambda t: -t["_m"])
     targets = targets[:3]
     for t in targets:
@@ -200,6 +200,9 @@ def _peaks(y, rng, thresh, min_sep=0.25, cap=14):
     return sorted(chosen)
 
 
+# ARCHIVED 2026-07-05: human/hard/falling split is disabled until motion detection is
+# solid — process_window emits every mover as "motion". Re-enable by calling classify()
+# in place of the "motion" literal. ponytail: kept (not deleted) for easy revival.
 def classify(strength, spread, speed):
     # ponytail: rule-based v1. Real system: micro-Doppler spread + gait periodicity.
     if speed > FALL_SPEED and spread < 0.2:
@@ -241,8 +244,6 @@ def live_loop():
             near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
             if near and abs(near["range"] - t["range"]) < 0.6:
                 t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
-                if t["vel"] > FALL_SPEED and t["spread"] < 0.2:
-                    t["class"] = "falling"
                 shown.append(t)
         for i, t in enumerate(shown):
             t["id"] = i
@@ -312,14 +313,14 @@ def _draw_map(ts, dbg, clutter, targets):
     for c in clutter:
         put(c["range"], c["az"], "·")
     for t in targets:
-        put(t["range"], t["az"], {"human": "H", "falling": "*"}.get(t["class"], "#"))
+        put(t["range"], t["az"], "M")
     grid[cy][cx] = "^"
 
     status = ("learning background…" if dbg.get("warm") else
               f"floor={dbg['floor']:.3f} peak={dbg['peak']:.3f} thr={dbg['thr']:.3f} moving={len(targets)}")
     lines = ["\033[H\033[2J",                                    # home cursor + clear
              f" t={ts:6.1f}s   {status}",
-             " legend: H=human  #=hard  *=falling  ·=static  ^=sensor",
+             " legend: M=motion  ·=static  ^=sensor",
              " +" + "-" * W + "+"]
     lines += [" |" + "".join(r) + "|" for r in grid]
     lines.append(" +" + "-" * W + f"+  depth 0..{MAX_RANGE:.0f}m up, width +/-{FOV}deg")
@@ -394,6 +395,38 @@ def serve():
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
+def motion_selftest():
+    """No hardware: synthetic static scene + a mover that appears. Asserts MTI stays
+    quiet on the static scene and fires at the mover's range. Proves the detection."""
+    chirp = make_chirp()
+    flen = int(FS * FRAME_MS / 1000)
+    rng = np.random.default_rng(0)
+
+    def win(mover=None):
+        w = np.zeros((PULSES_PER_WIN * flen, 2), dtype=np.float32)
+        for p in range(PULSES_PER_WIN):
+            sig = np.zeros(flen, dtype=np.float32)
+            sig[:len(chirp)] += chirp                             # direct path
+            for r, amp in ((1.5, 0.3), (3.0, 0.4)):               # static reflectors
+                lag = int(2 * r / C * FS); sig[lag:lag + len(chirp)] += amp * chirp
+            if mover:
+                lag = int(2 * mover / C * FS); sig[lag:lag + len(chirp)] += 0.25 * chirp
+            sig += rng.normal(0, 0.004, flen).astype(np.float32)
+            w[p * flen:(p + 1) * flen, 0] = sig
+            w[p * flen:(p + 1) * flen, 1] = sig
+        return w
+
+    _bg["prof"] = None; _bg["warm"] = 0
+    for _ in range(WARMUP + 3):                                   # learn static background
+        process_window(win(), chirp, flen)
+    _, quiet, _ = process_window(win(), chirp, flen)
+    assert not quiet, f"static should be quiet, got {quiet}"
+    _, moved, _ = process_window(win(2.2), chirp, flen)           # mover appears at 2.2 m
+    assert any(abs(t["range"] - 2.2) < 0.3 for t in moved), f"missed mover: {moved}"
+    print(f"motion selftest PASS: static quiet; mover detected at "
+          f"{[t['range'] for t in moved]} m")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--sim", action="store_true", help="synthetic data, no hardware")
@@ -406,7 +439,12 @@ if __name__ == "__main__":
     ap.add_argument("--band", choices=["high", "low"], default="high",
                     help="high=17-21kHz near-inaudible; low=8-12kHz audible but far more coherent")
     ap.add_argument("--map", action="store_true", help="live top-down ASCII radar in the terminal")
+    ap.add_argument("--selftest", action="store_true", help="synthetic motion-detection check (no hardware)")
     a = ap.parse_args()
+
+    if a.selftest:
+        motion_selftest()
+        sys.exit()
 
     if a.band == "low":                    # longer wavelength -> far less phase-noise
         sonar.F0, sonar.F1 = 8000, 12000
