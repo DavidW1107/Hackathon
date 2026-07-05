@@ -1,27 +1,23 @@
 #!/usr/bin/env python3
-"""Real-time acoustic motion sensor.
+"""Real-time acoustic motion sensor (coherent).
 
-Emits chirps, detects moving targets, classifies them (human/soft vs hard/rigid
-vs falling), estimates coarse azimuth from the 2-mic array, and serves detection
-frames as JSON over HTTP for the three.js viewer to render.
+Emits near-ultrasonic chirps, matched-filters the echo COHERENTLY (complex),
+references each echo to the direct speaker->mic path to cancel per-ping gain/
+phase drift, subtracts a learned static background, and reports moving reflectors
+with a CFAR (median/MAD) detector. Coarse azimuth from the 2-mic array. Serves
+detection frames over HTTP for the viewer and/or draws a terminal radar.
 
-  python sensor.py                              # live sensing on device 4
-  python sensor.py --sim                         # synthetic targets, no hardware
-  python sensor.py --sim --record web/sample.json --seconds 15   # make demo data
+Why coherent: incoherent |profile| differencing turns the laptop's own gain/
+phase drift into phantom "motion" (it fires even in a soundproof booth). Complex
+subtraction referenced to the direct path cancels a truly static scene to ~0.
+Technique adapted from "Sean Sonar".
 
-Frame contract (also what the viewer expects):
-  {
-    "t": <float seconds>,
-    "fov": <cone half-angle deg>, "max_range": <m>,
-    "clutter": [ {"range": m, "strength": 0..1} ],          # static (grey arcs)
-    "targets": [ {"id","range":m,"az":deg,"vel":m/s,
-                  "strength":0..1,"spread":0..1,"class":"human|hard|falling"} ]
-  }
+  python sensor.py --map                 # live top-down ASCII radar
+  python sensor.py --band low --map      # 8-12kHz audible, most coherent
+  python sensor.py --selftest            # synthetic motion check, no hardware
 
-DSP is deliberately simple for v1: per window of N pulses, matched-filter each
-into a range profile; static reflectors are the cross-pulse MEAN (clutter),
-motion is the cross-pulse STD (a moving echo fluctuates). Classification uses
-reflectivity + range-spread + speed. Doppler/micro-Doppler is the upgrade.
+Frame: {"t","fov","max_range","clutter":[{range,az,strength}],
+        "targets":[{id,range,az,vel,strength,spread,class:"motion",snr}]}
 """
 import argparse
 import json
@@ -34,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import numpy as np
 import sonar
-from sonar import FS, C, F0, F1, make_chirp, MIN_RANGE, MAX_RANGE
+from sonar import FS, C, make_chirp
 
 FRAME_MS = 90                 # long gap so room reverb decays before the next chirp
 PULSES_PER_WIN = 3            # average 3 chirps/window (~0.27 s, ~3.7 Hz) for SNR
@@ -42,37 +38,46 @@ DEVICE = 4                    # ALC285 analog, 2-ch
 MIC_BASELINE = 0.10           # m; assumed 2-mic spacing. ponytail: calibrate per laptop.
 PORT = 8765
 FOV = 50                      # forward cone half-angle (deg) we trust azimuth within
-MAX_RANGE = 4.0               # room size: range-gate + max mapped distance (overrides sonar)
+NEAR = 0.10                   # closest detectable range (m) — coherent ref handles near field
+MAX_RANGE = 2.0               # farthest mapped range (m); overrides sonar default
 
-# detection (tune live via /config?motion= or --motion)
 CLUTTER_THRESH = 0.45         # fraction of background peak = a static reflector
-MOTION_THRESH = 0.08          # residual margin ABOVE the change-floor (adaptive MTI)
-FALL_SPEED = 2.0              # m/s + compact -> falling
-SPREAD_HUMAN = 0.30           # range-spread (m) or weak echo -> human/soft
-SENSOR_MIN = 0.5              # m; skip near-field crosstalk
-BG_ALPHA = 0.05               # background EMA rate (how fast the static scene is learned)
-WARMUP = 10                   # windows to learn the background before detecting
+SNR_THRESH = 3.0              # detect when residual peak > median + SNR_THRESH*sigma
+ABS_FLOOR = 0.002             # min residual (echo/direct ratio) to count
+WARMUP = 15                   # windows to learn the static background before detecting
+CAL_RATE = 1.0 / 12           # background learning rate during warmup
+BG_ADAPT = 0.02               # slow background adaptation in quiet bins
+GUARD = 40                    # bins around the peak excluded from the CFAR noise estimate
 
-# azimuth calibration (baseline in m + sign), overridden by calib.json if present
-CALIB_FILE = os.path.join(os.path.dirname(__file__), "calib.json")
-_calib = {"baseline": MIC_BASELINE, "sign": 1.0}
-if os.path.exists(CALIB_FILE):
-    try:
-        _calib.update(json.load(open(CALIB_FILE)))
-    except Exception:
-        pass
-
-_cfg = {"motion": MOTION_THRESH}   # live-tunable via GET /config?motion=<val>
-_bg = {"prof": None, "warm": 0}    # MTI static-scene background + warmup counter
-_view = {"map": False}             # --map: draw a top-down ASCII radar instead of log lines
+_cfg = {"snr": SNR_THRESH, "abs": None}   # abs = absolute residual threshold; overrides snr
+_bg = {"prof": None, "warm": 0}    # complex static background + warmup counter
+_mf = {"conj": None, "cn": 0, "nfft": 0}   # complex matched-filter kernel (set per band)
+_view = {"map": False}
 _latest = {"t": 0, "fov": FOV, "max_range": MAX_RANGE, "clutter": [], "targets": []}
 _lock = threading.Lock()
 
 
-# ---------- DSP ----------
+# ---------- matched filter (complex / coherent) ----------
+
+def build_mf(flen):
+    """Build the analytic (complex) chirp + conj-FFT kernel. Call after band set."""
+    n = int(FS * sonar.CHIRP_MS / 1000)
+    t = np.arange(n) / FS
+    k = (sonar.F1 - sonar.F0) / (sonar.CHIRP_MS / 1000)
+    cchirp = np.exp(1j * 2 * np.pi * (sonar.F0 * t + 0.5 * k * t * t)) * np.hanning(n)
+    nfft = 1 << (flen + n).bit_length()
+    _mf.update(conj=np.conj(np.fft.fft(cchirp, nfft)), cn=n, nfft=nfft)
+
+
+def _cmf(x):
+    """Complex matched filter: correlation of x against the analytic chirp."""
+    corr = np.fft.ifft(np.fft.fft(x, _mf["nfft"]) * _mf["conj"])
+    return corr[:len(x) - _mf["cn"] + 1]
+
+
+# ---------- helpers ----------
 
 def _clusters(mask):
-    """Contiguous True runs in a boolean array -> list of (start,end) inclusive."""
     out, s = [], None
     for i, v in enumerate(mask):
         if v and s is None:
@@ -85,110 +90,14 @@ def _clusters(mask):
 
 
 def _parabolic(y, i):
-    """Sub-sample peak offset around index i (for finer azimuth)."""
     if 0 < i < len(y) - 1:
-        denom = (y[i - 1] - 2 * y[i] + y[i + 1])
-        if abs(denom) > 1e-12:
-            return i + 0.5 * (y[i - 1] - y[i + 1]) / denom
+        d = (y[i - 1] - 2 * y[i] + y[i + 1])
+        if abs(d) > 1e-12:
+            return i + 0.5 * (y[i - 1] - y[i + 1]) / d
     return float(i)
 
 
-def _lag(seg0, seg1):
-    """Sub-sample inter-mic delay (samples) via cross-correlation."""
-    a = seg0 - seg0.mean(); b = seg1 - seg1.mean()
-    if a.std() < 1e-6 or b.std() < 1e-6:
-        return 0.0
-    xc = np.abs(np.correlate(a, b, "full"))
-    return _parabolic(xc, int(np.argmax(xc))) - (len(b) - 1)
-
-
-def _azimuth(seg0, seg1):
-    """Inter-mic lag -> azimuth (deg), using calibrated baseline + sign. Front cone only."""
-    sin_th = np.clip(_calib["sign"] * _lag(seg0, seg1) / FS * C / _calib["baseline"], -1, 1)
-    return math.degrees(math.asin(sin_th))
-
-
-def _az_at(rec2, flen, t0, minlag, bin_, P):
-    """Azimuth (deg) of the reflector in range-bin `bin_`, median over pulses."""
-    g = t0 + minlag + bin_
-    return float(np.clip(np.median(
-        [_azimuth(rec2[p * flen:(p + 1) * flen, 0][max(g - 200, 0):g + 200],
-                  rec2[p * flen:(p + 1) * flen, 1][max(g - 200, 0):g + 200]) for p in range(P)]),
-        -FOV, FOV))
-
-
-def process_window(rec2, chirp, flen):
-    """Average this window's chirps, subtract the learned static background (MTI).
-    -> (clutter from background, moving targets from residual, debug dict)."""
-    minlag = int(2 * MIN_RANGE / C * FS)
-    maxlag = int(2 * MAX_RANGE / C * FS)
-    P = rec2.shape[0] // flen
-    corrs = [np.abs(np.correlate(rec2[p * flen:(p + 1) * flen, 0], chirp, "valid"))
-             for p in range(P)]
-    L = min(len(c) for c in corrs)
-    t0 = int(np.argmax(np.sum([c[:L] for c in corrs], 0)))    # common direct-path ref
-    nb = min(maxlag, L - t0) - minlag
-    if nb <= 0:
-        return [], [], {"peak": 0.0, "floor": 0.0, "thr": 0.0, "raw": 0, "warm": True}
-    prof = np.vstack([c[t0 + minlag:t0 + minlag + nb] for c in corrs])
-    rng = (minlag + np.arange(nb)) / FS * C / 2
-    cur = prof.mean(0)                                        # average window -> SNR
-
-    B = _bg["prof"]
-    if B is None or len(B) != nb:                            # (re)initialise background
-        _bg["prof"] = cur.copy(); _bg["warm"] = 0
-        B = cur
-    else:                                                    # align cur to background:
-        x = np.correlate(cur - cur.mean(), B - B.mean(), "full")   # remove inter-window
-        shift = int(np.argmax(x)) - (nb - 1)                       # latency jitter
-        if 0 < abs(shift) <= 30:
-            cur = np.roll(cur, -shift)
-    warming = _bg["warm"] < WARMUP
-    resid = np.abs(cur - B)                                   # MTI: change from static
-    _bg["prof"] = (1 - BG_ALPHA) * B + BG_ALPHA * cur         # slowly follow the room
-    _bg["warm"] += 1
-
-    norm = B.max() + 1e-9
-    Bn, curn, residn = B / norm, cur / norm, resid / norm
-    gate = rng >= SENSOR_MIN
-
-    # static scene (background) -> clutter to render the room
-    clutter = [{"range": round(float(rng[i]), 2),
-                "az": round(_az_at(rec2, flen, t0, minlag, i, P), 1),
-                "strength": round(float(Bn[i]), 2)}
-               for i in _peaks(Bn * gate, rng, CLUTTER_THRESH, min_sep=0.5, cap=6)]
-
-    rg = residn[gate]
-    floor = float(np.median(rg)) if rg.size else 0.0
-    eff = _cfg["motion"] + floor                             # adaptive on the change-floor
-    dbg = {"peak": round(float(rg.max()), 3) if rg.size else 0.0,
-           "floor": round(floor, 3), "thr": round(eff, 3), "raw": 0, "warm": warming}
-    if warming:
-        return clutter, [], dbg
-
-    targets = []
-    clusters = _clusters((residn > eff) & gate)
-    dbg["raw"] = len(clusters)
-    for a, b in clusters:
-        spread = float(rng[b] - rng[a])
-        if spread > 1.5:
-            continue
-        peak = a + int(np.argmax(residn[a:b + 1]))
-        strength = float(curn[peak])
-        az = _az_at(rec2, flen, t0, minlag, peak, P)
-        targets.append({"id": 0, "range": round(float(rng[peak]), 2), "az": round(az, 1),
-                        "vel": 0.0, "strength": round(strength, 2),
-                        "spread": round(min(spread, 1.0), 2),
-                        "class": classify(strength, spread, 0.0), "_m": float(residn[peak])})
-    targets.sort(key=lambda t: -t["_m"])
-    targets = targets[:3]
-    for t in targets:
-        t.pop("_m")
-    return clutter, targets, dbg
-
-
-def _peaks(y, rng, thresh, min_sep=0.25, cap=14):
-    """Prominent local maxima above thresh, at least min_sep apart, strongest first."""
+def _peaks(y, rng, thresh, min_sep=0.3, cap=6):
     idx = [i for i in range(1, len(y) - 1) if y[i] > thresh and y[i] >= y[i - 1] and y[i] >= y[i + 1]]
     idx.sort(key=lambda i: -y[i])
     chosen = []
@@ -200,77 +109,175 @@ def _peaks(y, rng, thresh, min_sep=0.25, cap=14):
     return sorted(chosen)
 
 
+def _az_at(rec2, flen, t0, minlag, bin_, P):
+    """Azimuth (deg) from the 2-mic time delay at range-bin `bin_`. Coarse, front cone."""
+    g = t0 + minlag + bin_
+    lags = []
+    for p in range(P):
+        a = rec2[p * flen:(p + 1) * flen, 0][max(g - 200, 0):g + 200]
+        b = rec2[p * flen:(p + 1) * flen, 1][max(g - 200, 0):g + 200]
+        if a.std() < 1e-6 or b.std() < 1e-6:
+            continue
+        xc = np.abs(np.correlate(a - a.mean(), b - b.mean(), "full"))
+        lags.append(_parabolic(xc, int(np.argmax(xc))) - (len(b) - 1))
+    if not lags:
+        return 0.0
+    sin_th = np.clip(np.median(lags) / FS * C / MIC_BASELINE, -1, 1)
+    return float(np.clip(math.degrees(math.asin(sin_th)), -FOV, FOV))
+
+
+# ARCHIVED 2026-07-05: human/hard/falling split disabled until motion detection is
+# solid — detections are all "motion". Re-enable by calling classify(). Kept, not deleted.
 def classify(strength, spread, speed):
-    # ponytail: rule-based v1. Real system: micro-Doppler spread + gait periodicity.
-    if speed > FALL_SPEED and spread < 0.2:
-        return "falling"          # fast + compact = rigid body in flight
-    if spread > SPREAD_HUMAN or strength < 0.25:
-        return "human"            # range-smeared or weakly reflective = soft/articulated
-    return "hard"                 # tight + strongly reflective = rigid surface (door)
+    if speed > 2.0 and spread < 0.2:
+        return "falling"
+    if spread > 0.30 or strength < 0.25:
+        return "human"
+    return "hard"
 
 
-# ---------- capture loops ----------
+# ---------- coherent detection ----------
+
+def _clutter(Bmag, rng, rec2, flen, t0, minlag, P):
+    norm = Bmag.max() + 1e-9
+    return [{"range": round(float(rng[i]), 2),
+             "az": round(_az_at(rec2, flen, t0, minlag, i, P), 1),
+             "strength": round(float(Bmag[i] / norm), 2)}
+            for i in _peaks(Bmag / norm, rng, CLUTTER_THRESH)]
+
+
+def _dbg(noise=0.0, peak=0.0, thr=0.0, raw=0, warm=False):
+    return {"noise": round(noise, 4), "peak": round(peak, 4),
+            "thr": round(thr, 4), "raw": raw, "warm": warm}
+
+
+def process_window(rec2, flen):
+    """Coherent MTI. -> (clutter, moving targets, debug). Uses module _mf + _bg."""
+    minlag = int(2 * NEAR / C * FS)
+    maxlag = int(2 * MAX_RANGE / C * FS)
+    P = rec2.shape[0] // flen
+    segs, ds = [], []
+    for p in range(P):
+        c0 = _cmf(rec2[p * flen:(p + 1) * flen, 0].astype(np.float64))
+        d = int(np.argmax(np.abs(c0)))
+        if d + maxlag > len(c0) or abs(c0[d]) < 1e-9:
+            continue
+        segs.append(c0[d + minlag:d + maxlag] / c0[d])   # per-ping ref cancels the phase
+        ds.append(d)                                     # drift a slow ref can't track
+    if not segs:
+        return [], [], _dbg()
+    nb = min(len(s) for s in segs)
+    cur = np.mean([s[:nb] for s in segs], axis=0)        # complex average -> SNR
+    rng = (minlag + np.arange(nb)) / FS * C / 2
+    t0 = int(np.median(ds))
+
+    B = _bg["prof"]
+    if B is None or len(B) != nb:                        # (re)initialise background
+        _bg["prof"] = cur.copy(); _bg["warm"] = 0
+        return [], [], _dbg(warm=True)
+    if _bg["warm"] < WARMUP:                             # learn the static scene
+        _bg["prof"] = (1 - CAL_RATE) * B + CAL_RATE * cur
+        _bg["warm"] += 1
+        return _clutter(np.abs(B), rng, rec2, flen, t0, minlag, P), [], _dbg(warm=True)
+
+    resid = np.abs(cur - B)                              # coherent subtraction (static ~0)
+    i = int(np.argmax(resid))                            # CFAR: exclude the peak's own lobe
+    noise = np.concatenate([resid[:max(i - GUARD, 0)], resid[i + GUARD:]])  # from the noise est
+    med = float(np.median(noise))
+    sigma = 1.4826 * float(np.median(np.abs(noise - med))) + 1e-9
+    thr = _cfg["abs"] if _cfg["abs"] is not None else med + _cfg["snr"] * sigma
+    B[resid < med + 3 * sigma] = ((1 - BG_ADAPT) * B + BG_ADAPT * cur)[resid < med + 3 * sigma]
+
+    clutter = _clutter(np.abs(B), rng, rec2, flen, t0, minlag, P)
+    dbg = _dbg(sigma, float(resid.max()), thr, 0, False)
+    targets = []
+    clusters = _clusters(resid > thr)
+    dbg["raw"] = len(clusters)
+    for a, b in clusters:
+        if rng[b] - rng[a] > 1.5:
+            continue
+        peak = a + int(np.argmax(resid[a:b + 1]))
+        if resid[peak] < ABS_FLOOR:
+            continue
+        targets.append({"id": 0, "range": round(float(rng[peak]), 2),
+                        "az": round(_az_at(rec2, flen, t0, minlag, peak, P), 1),
+                        "vel": 0.0, "strength": round(float(min(abs(cur[peak]), 1.0)), 2),
+                        "spread": round(float(min(rng[b] - rng[a], 1.0)), 2),
+                        "class": "motion", "snr": round(float((resid[peak] - med) / sigma), 1),
+                        "_m": float(resid[peak])})
+    targets.sort(key=lambda t: -t["_m"])
+    targets = targets[:3]
+    for t in targets:
+        t.pop("_m")
+    return clutter, targets, dbg
+
+
+# ---------- capture ----------
 
 def live_loop():
-    """Blocking playrec loop: emit PULSES_PER_WIN chirps, capture 2 ch, detect.
-    ponytail: ~3 Hz and rock-solid. A callback stream is faster but segfaulted on
-    this ALSA setup; the viewer lerp-smooths to 60 fps so 3 Hz reads fine.
-    Knob: lower PULSES_PER_WIN for snappier (noisier) updates."""
+    """Continuous full-duplex stream (shared clock -> stable phase, so coherent
+    subtraction actually cancels). Emits a looping chirp; a queue feeds windows to
+    the detector, advancing one ping at a time. Blocking playrec cannot do this."""
+    import queue
     import sounddevice as sd
-    sd.default.device = DEVICE
-    chirp = make_chirp()
     flen = int(FS * FRAME_MS / 1000)
-    fr = np.zeros(flen, dtype=np.float32); fr[:len(chirp)] = chirp
-    emit = np.tile(fr, PULSES_PER_WIN) * 0.8
-    t_start = time.monotonic()
+    build_mf(flen)
+    chirp = make_chirp()
+    tx = np.zeros(flen, dtype=np.float32); tx[:len(chirp)] = chirp * 0.8
+    win = PULSES_PER_WIN * flen
+    q: "queue.Queue[np.ndarray]" = queue.Queue()
+    st = {"tx": 0}
+
+    def cb(indata, outdata, frames, tinfo, status):
+        idx = (st["tx"] + np.arange(frames)) % flen        # loop the chirp forever
+        outdata[:] = tx[idx][:, None]
+        st["tx"] = (st["tx"] + frames) % flen
+        q.put(indata.copy())                                # 2-ch capture -> main loop
+
     prev = []
-    dt = PULSES_PER_WIN * FRAME_MS / 1000
+    dt = flen / FS                                          # windows advance one ping
+    t_start = time.monotonic()
+    mode = f"abs>{_cfg['abs']}" if _cfg["abs"] is not None else f"snr>{_cfg['snr']:.0f}"
     print(f"live sensing on device {DEVICE}  (band={sonar.F0 // 1000}-{sonar.F1 // 1000}kHz, "
-          f"range<={MAX_RANGE:.0f}m, margin={_cfg['motion']:.3f})")
-    print(f"tune live:  curl 'http://localhost:{PORT}/config?motion=0.12'\n")
-    while True:
-        rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
-        try:
-            clutter, targets, dbg = process_window(rec, chirp, flen)
-        except Exception as e:
-            print("process error:", e); continue
-        # persistence + velocity: keep only targets matching one from the previous
-        # frame (within 0.6 m); velocity = its range change / frame time.
-        shown = []
-        for t in targets:
-            near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
-            if near and abs(near["range"] - t["range"]) < 0.6:
-                t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
-                if t["vel"] > FALL_SPEED and t["spread"] < 0.2:
-                    t["class"] = "falling"
-                shown.append(t)
-        for i, t in enumerate(shown):
-            t["id"] = i
-        prev = targets
-        ts = time.monotonic() - t_start
-        _publish(ts, clutter, shown)
-        (_draw_map if _view["map"] else _log)(ts, dbg, clutter, shown)
+          f"range {NEAR:.2f}-{MAX_RANGE:.0f}m, {mode})")
+    print(f"tune live:  curl 'http://localhost:{PORT}/config?thresh=0.6'   (or ?snr=5, ?thresh=auto)\n")
+    buf = np.zeros((0, 2), dtype=np.float32)
+    with sd.Stream(samplerate=FS, channels=2, dtype="float32", device=DEVICE, callback=cb):
+        while True:
+            buf = np.concatenate([buf, q.get()])
+            while len(buf) >= win:
+                window = buf[:win]
+                buf = buf[flen:]                            # advance exactly one ping
+                try:
+                    clutter, targets, dbg = process_window(window, flen)
+                except Exception as e:
+                    print("process error:", e); continue
+                shown = []
+                for t in targets:                           # persistence + velocity
+                    near = min(prev, key=lambda p: abs(p["range"] - t["range"]), default=None)
+                    if near and abs(near["range"] - t["range"]) < 0.6:
+                        t["vel"] = round(abs(t["range"] - near["range"]) / dt, 2)
+                        shown.append(t)
+                for i, t in enumerate(shown):
+                    t["id"] = i
+                prev = targets
+                ts = time.monotonic() - t_start
+                _publish(ts, clutter, shown)
+                (_draw_map if _view["map"] else _log)(ts, dbg, clutter, shown)
 
 
 def sim_loop():
-    """Synthetic scene: a human pacing across the cone + an occasional hard mover."""
+    """Synthetic motion for viewer/no-hardware dev (not real data)."""
     t_start = time.monotonic()
-    i = 0
     while True:
         t = time.monotonic() - t_start
-        az = FOV * math.sin(t * 0.6)                     # human paces left<->right
-        rng = 2.4 + 0.5 * math.sin(t * 0.9)
+        az = FOV * math.sin(t * 0.6)
+        rng = 1.4 + 0.4 * math.sin(t * 0.9)
         targets = [{"id": 0, "range": round(rng, 2), "az": round(az, 1),
                     "vel": round(0.6 + 0.3 * abs(math.cos(t * 0.6)), 2),
-                    "strength": 0.18, "spread": 0.45, "class": "human"}]
-        if int(t) % 7 == 3:                              # a door swings now and then
-            targets.append({"id": 1, "range": 1.3, "az": -38, "vel": 0.9,
-                            "strength": 0.7, "spread": 0.1, "class": "hard"})
-        clutter = [{"range": 3.8, "az": 4, "strength": 0.85},     # back wall (strong)
-                   {"range": 1.8, "az": -32, "strength": 0.4},    # couch (soft)
-                   {"range": 3.0, "az": 38, "strength": 0.6}]     # doorway (medium)
+                    "strength": 0.3, "spread": 0.4, "class": "motion", "snr": 12.0}]
+        clutter = [{"range": 1.9, "az": 4, "strength": 0.85}, {"range": 1.0, "az": -30, "strength": 0.5}]
         _publish(t, clutter, targets)
-        i += 1
         time.sleep(FRAME_MS * PULSES_PER_WIN / 1000)
 
 
@@ -280,20 +287,18 @@ def _publish(t, clutter, targets):
 
 
 def _log(ts, dbg, clutter, targets):
-    """Readable per-window line; expands to one row per moving target."""
     if dbg.get("warm"):
         print(f"[{ts:6.1f}s]  learning background…", flush=True)
         return
-    head = (f"[{ts:6.1f}s]  change floor={dbg['floor']:.3f}  peak={dbg['peak']:.3f}  "
-            f"thr={dbg['thr']:.3f}  moving={len(targets)}")
+    head = (f"[{ts:6.1f}s]  noise={dbg['noise']:.4f}  peak={dbg['peak']:.4f}  "
+            f"thr={dbg['thr']:.4f}  moving={len(targets)}")
     if not targets:
         print(head + "   · still", flush=True)
         return
     print(head, flush=True)
     for t in targets:
-        bar = "█" * min(int(t["strength"] * 20), 20)
-        print(f"      {t['class']:<7} {t['range']:4.2f}m  az {t['az']:+6.1f}°  "
-              f"{t['vel']:4.2f} m/s  refl {bar}", flush=True)
+        print(f"      motion  {t['range']:4.2f}m  az {t['az']:+6.1f}°  "
+              f"{t['vel']:4.2f} m/s  snr {t.get('snr', 0):4.1f}", flush=True)
 
 
 def _draw_map(ts, dbg, clutter, targets):
@@ -312,27 +317,56 @@ def _draw_map(ts, dbg, clutter, targets):
     for c in clutter:
         put(c["range"], c["az"], "·")
     for t in targets:
-        put(t["range"], t["az"], {"human": "H", "falling": "*"}.get(t["class"], "#"))
+        put(t["range"], t["az"], "M")
     grid[cy][cx] = "^"
 
     status = ("learning background…" if dbg.get("warm") else
-              f"floor={dbg['floor']:.3f} peak={dbg['peak']:.3f} thr={dbg['thr']:.3f} moving={len(targets)}")
-    lines = ["\033[H\033[2J",                                    # home cursor + clear
+              f"noise={dbg['noise']:.4f} peak={dbg['peak']:.4f} thr={dbg['thr']:.4f} moving={len(targets)}")
+    lines = ["\033[H\033[2J",
              f" t={ts:6.1f}s   {status}",
-             " legend: H=human  #=hard  *=falling  ·=static  ^=sensor",
+             " legend: M=motion  ·=static  ^=sensor",
              " +" + "-" * W + "+"]
     lines += [" |" + "".join(r) + "|" for r in grid]
-    lines.append(" +" + "-" * W + f"+  depth 0..{MAX_RANGE:.0f}m up, width +/-{FOV}deg")
+    lines.append(" +" + "-" * W + f"+  depth {NEAR:.1f}..{MAX_RANGE:.0f}m up, width +/-{FOV}deg")
     for t in targets:
-        lines.append(f"   {t['class']:<7} {t['range']:.2f}m  az {t['az']:+.0f}deg  {t['vel']:.2f}m/s")
+        lines.append(f"   motion {t['range']:.2f}m  az {t['az']:+.0f}deg  {t['vel']:.2f}m/s  snr {t.get('snr',0):.1f}")
     print("\n".join(lines), flush=True)
 
 
+def motion_selftest():
+    """No hardware: synthetic static scene + a mover that appears. Asserts the
+    coherent MTI stays quiet on static and fires at the mover's range."""
+    flen = int(FS * FRAME_MS / 1000)
+    build_mf(flen)
+    chirp = make_chirp()
+    rng = np.random.default_rng(0)
+
+    def win(mover=None):
+        w = np.zeros((PULSES_PER_WIN * flen, 2), dtype=np.float32)
+        for p in range(PULSES_PER_WIN):
+            sig = np.zeros(flen, dtype=np.float32)
+            sig[:len(chirp)] += chirp
+            for r, amp in ((0.8, 0.3), (1.6, 0.35)):          # static reflectors
+                lag = int(2 * r / C * FS); sig[lag:lag + len(chirp)] += amp * chirp
+            if mover:
+                lag = int(2 * mover / C * FS); sig[lag:lag + len(chirp)] += 0.2 * chirp
+            sig += rng.normal(0, 0.003, flen).astype(np.float32)
+            w[p * flen:(p + 1) * flen, 0] = sig
+            w[p * flen:(p + 1) * flen, 1] = sig
+        return w
+
+    _bg["prof"] = None; _bg["warm"] = 0
+    for _ in range(WARMUP + 3):
+        process_window(win(), flen)
+    _, quiet, _ = process_window(win(), flen)
+    assert not quiet, f"static should be quiet, got {quiet}"
+    _, moved, _ = process_window(win(1.2), flen)
+    assert any(abs(t["range"] - 1.2) < 0.3 for t in moved), f"missed mover: {moved}"
+    print(f"motion selftest PASS: static quiet; mover detected at {[t['range'] for t in moved]} m")
+
+
 def calibrate(angle_deg):
-    """Put a strong flat reflector (or stand) at a KNOWN azimuth (right = +, e.g.
-    1 m to your right at 2 m deep ~= +27 deg). Measures the inter-mic lag on the
-    dominant reflector and solves the mic baseline + sign. Writes calib.json.
-    ponytail: single-point solve; assumes boresight (straight-ahead) = 0 deg."""
+    """Reflector at a KNOWN azimuth (right +) -> solve mic baseline + sign."""
     import sounddevice as sd
     sd.default.device = DEVICE
     chirp = make_chirp()
@@ -345,13 +379,14 @@ def calibrate(angle_deg):
         rec = sd.playrec(emit, samplerate=FS, channels=2, dtype="float32"); sd.wait()
         c0 = np.abs(np.correlate(rec[:flen, 0], chirp, "valid"))
         t0 = int(np.argmax(c0))
-        lo = t0 + int(2 * SENSOR_MIN / C * FS)
+        lo = t0 + int(2 * NEAR / C * FS)
         seg = c0[lo:min(t0 + int(2 * MAX_RANGE / C * FS), len(c0))]
         if not len(seg):
             continue
-        g = lo + int(np.argmax(seg))                 # dominant reflector past near field
-        lags.append(_lag(rec[:flen, 0][max(g - 200, 0):g + 200],
-                         rec[:flen, 1][max(g - 200, 0):g + 200]))
+        g = lo + int(np.argmax(seg))
+        a = rec[:flen, 0][max(g - 200, 0):g + 200]; b = rec[:flen, 1][max(g - 200, 0):g + 200]
+        xc = np.abs(np.correlate(a - a.mean(), b - b.mean(), "full"))
+        lags.append(_parabolic(xc, int(np.argmax(xc))) - (len(b) - 1))
     lag = float(np.median(lags)) if lags else 0.0
     th = math.radians(angle_deg)
     if abs(math.sin(th)) < 0.05 or abs(lag) < 1e-3:
@@ -359,9 +394,9 @@ def calibrate(angle_deg):
         return
     baseline = abs(lag) / FS * C / abs(math.sin(th))
     sign = math.copysign(1, lag) * math.copysign(1, angle_deg)
-    json.dump({"baseline": round(baseline, 4), "sign": sign}, open(CALIB_FILE, "w"))
-    print(f"calibrated: lag={lag:.2f} samp -> baseline={baseline * 100:.1f} cm, "
-          f"sign={sign:+.0f}. Saved {CALIB_FILE}")
+    cf = os.path.join(os.path.dirname(__file__), "calib.json")
+    json.dump({"baseline": round(baseline, 4), "sign": sign}, open(cf, "w"))
+    print(f"calibrated: baseline={baseline * 100:.1f} cm, sign={sign:+.0f}. Saved {cf}")
 
 
 # ---------- HTTP ----------
@@ -371,12 +406,18 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
     def do_GET(self):
-        if self.path.startswith("/config"):                 # live-tune detection knobs
+        if self.path.startswith("/config"):
             from urllib.parse import urlparse, parse_qs
             q = parse_qs(urlparse(self.path).query)
-            if "motion" in q:
+            if "snr" in q:
                 try:
-                    _cfg["motion"] = max(0.02, min(1.0, float(q["motion"][0])))
+                    _cfg["snr"] = max(0.5, min(30.0, float(q["snr"][0])))
+                except ValueError:
+                    pass
+            if "thresh" in q:                            # absolute; "auto" reverts to snr
+                v = q["thresh"][0]
+                try:
+                    _cfg["abs"] = None if v in ("", "auto", "off") else float(v)
                 except ValueError:
                     pass
             body = json.dumps(_cfg).encode()
@@ -385,7 +426,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = json.dumps(_latest).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
-        self.send_header("Access-Control-Allow-Origin", "*")  # viewer on another origin
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(body)
 
@@ -397,32 +438,36 @@ def serve():
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--sim", action="store_true", help="synthetic data, no hardware")
-    ap.add_argument("--record", metavar="FILE", help="dump frames to FILE for replay")
+    ap.add_argument("--record", metavar="FILE", help="dump frames to FILE")
     ap.add_argument("--seconds", type=float, default=0, help="stop after N s (with --record)")
     ap.add_argument("--calibrate", type=float, metavar="DEG",
                     help="calibrate azimuth: reflector at this known angle (right +)")
-    ap.add_argument("--motion", type=float, metavar="THR",
-                    help="initial motion threshold (default from MOTION_THRESH); tune live via /config")
+    ap.add_argument("--snr", type=float, metavar="K", help="adaptive threshold in sigma (default 3)")
+    ap.add_argument("--thresh", type=float, metavar="T",
+                    help="absolute residual threshold (overrides --snr; watch peak= to pick it)")
     ap.add_argument("--band", choices=["high", "low"], default="high",
                     help="high=17-21kHz near-inaudible; low=8-12kHz audible but far more coherent")
     ap.add_argument("--map", action="store_true", help="live top-down ASCII radar in the terminal")
+    ap.add_argument("--selftest", action="store_true", help="synthetic motion-detection check (no hardware)")
     a = ap.parse_args()
 
-    if a.band == "low":                    # longer wavelength -> far less phase-noise
+    if a.band == "low":
         sonar.F0, sonar.F1 = 8000, 12000
-    if a.map:
-        _view["map"] = True
-    if a.motion is not None:
-        _cfg["motion"] = a.motion
-
+    if a.snr is not None:
+        _cfg["snr"] = a.snr
+    if a.thresh is not None:
+        _cfg["abs"] = a.thresh
+    if a.selftest:
+        motion_selftest()
+        sys.exit()
     if a.calibrate is not None:
         calibrate(a.calibrate)
         sys.exit()
+    if a.map:
+        _view["map"] = True
 
     loop = sim_loop if a.sim else live_loop
-
     if a.record:
-        # run the loop in a thread, snapshot frames, write a JSON array
         threading.Thread(target=loop, daemon=True).start()
         frames, t0 = [], time.monotonic()
         while time.monotonic() - t0 < (a.seconds or 15):
